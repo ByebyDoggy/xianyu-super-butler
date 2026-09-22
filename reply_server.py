@@ -3076,8 +3076,8 @@ def get_public_system_settings():
 
 
 @app.get('/system-settings')
-def get_system_settings(_: None = Depends(require_auth)):
-    """获取系统设置（排除敏感信息）"""
+def get_system_settings(_: None = Depends(require_admin)):
+    """获取系统设置（仅管理员，排除敏感信息）"""
     from db_manager import db_manager
     try:
         settings = db_manager.get_all_system_settings()
@@ -3090,8 +3090,8 @@ def get_system_settings(_: None = Depends(require_auth)):
 
 
 @app.put('/system-settings/{key}')
-def update_system_setting(key: str, setting_data: SystemSettingIn, _: None = Depends(require_auth)):
-    """更新系统设置"""
+def update_system_setting(key: str, setting_data: SystemSettingIn, _: None = Depends(require_admin)):
+    """更新系统设置（仅管理员）"""
     from db_manager import db_manager
     try:
         # 禁止直接修改密码哈希
@@ -3107,6 +3107,54 @@ def update_system_setting(key: str, setting_data: SystemSettingIn, _: None = Dep
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ------------------------- 在线更新 -------------------------
+
+class UpdateApplyRequest(BaseModel):
+    restart: bool = False
+    force: bool = False
+
+
+@app.get('/system/update/check')
+def check_system_update(admin_user: Dict[str, Any] = Depends(require_admin)):
+    """检查是否有新版本（仅管理员）"""
+    from db_manager import db_manager
+    from utils.updater import check_update, UpdateError
+    try:
+        result = check_update(db_manager)
+        log_with_user('info', f"检查在线更新: {result.get('repo')}@{result.get('branch')}", admin_user)
+        return result
+    except UpdateError as e:
+        log_with_user('warning', f"检查在线更新失败: {e}", admin_user)
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"检查更新异常: {e}")
+        raise HTTPException(status_code=500, detail="检查更新失败")
+
+
+@app.post('/system/update/apply')
+def apply_system_update(req: UpdateApplyRequest, admin_user: Dict[str, Any] = Depends(require_admin)):
+    """执行在线更新（仅管理员）"""
+    from db_manager import db_manager
+    from utils.updater import apply_update, schedule_restart, UpdateError
+    try:
+        result = apply_update(db_manager, force=req.force)
+        log_with_user(
+            'warning',
+            f"执行在线更新: {result.get('repo')}@{result.get('branch')} ({result.get('method')})",
+            admin_user,
+        )
+        result['restart_scheduled'] = False
+        if req.restart:
+            result['restart_scheduled'] = schedule_restart()
+        return result
+    except UpdateError as e:
+        log_with_user('warning', f"在线更新失败: {e}", admin_user)
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"在线更新异常: {e}")
+        raise HTTPException(status_code=500, detail="在线更新失败")
 
 
 # ------------------------- 注册设置接口 -------------------------

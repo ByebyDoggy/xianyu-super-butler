@@ -12,6 +12,7 @@ import { ShieldCheck, ArrowRight, Loader2, User, Lock, TerminalSquare } from 'lu
 
 const App: React.FC = () => {
   const [isLoggedIn, setIsLoggedIn] = useState(false);
+  const [isAdmin, setIsAdmin] = useState(false);
   const [activeTab, setActiveTab] = useState('dashboard');
   const [checkingAuth, setCheckingAuth] = useState(true);
   const [needsInit, setNeedsInit] = useState(false);
@@ -31,7 +32,10 @@ const App: React.FC = () => {
           }
 
           setNeedsInit(false);
-          if (res?.authenticated) setIsLoggedIn(true);
+          if (res?.authenticated) {
+            setIsLoggedIn(true);
+            setIsAdmin(Boolean(res?.is_admin));
+          }
         })
         .catch(() => setIsLoggedIn(false))
         .finally(() => setCheckingAuth(false));
@@ -189,7 +193,10 @@ const App: React.FC = () => {
       case 'cards': return <CardList />;
       case 'items': return <ItemList />;
       case 'keywords': return <Keywords />;
-      case 'settings': return <Settings />;
+      case 'settings':
+        return isAdmin
+          ? <Settings />
+          : <div className="p-8 text-center text-gray-400 font-medium">需要管理员权限</div>;
       default: return <Dashboard />;
     }
   };
@@ -198,7 +205,8 @@ const App: React.FC = () => {
     <div className="flex min-h-screen bg-[#F4F5F7] text-[#111]">
       <Sidebar 
         activeTab={activeTab} 
-        setActiveTab={setActiveTab} 
+        setActiveTab={setActiveTab}
+        isAdmin={isAdmin}
         onLogout={() => {
             setIsLoggedIn(false);
         }}

@@ -61,6 +61,8 @@ python -m venv .venv-test
 | V-15 | 容器以 root 运行；Compose 内置弱默认口令/密钥 | **中** | `Dockerfile`、`Dockerfile-cn`、`docker-compose*.yml` | ✅ 已修复 |
 | V-16 | 管理员数据浏览接口返回口令哈希等敏感列 | **低** | `db_manager.get_table_data` | ✅ 已修复（脱敏 + 表名强校验） |
 | V-17 | HTTPException 被 `except Exception` 吞并转 500（错误处理缺陷） | **低** | `reply_server.py` 多处 | ✅ 已修复 |
+| V-18 | 任意登录用户可修改全局系统设置（越权/提权） | **高** | `PUT /system-settings/{key}` | ✅ 已修复 |
+| V-19 | 任意登录用户可读取系统设置（含 AI Key / SMTP 密码 / API 秘钥） | **高** | `GET /system-settings` | ✅ 已修复 |
 
 ---
 
@@ -165,6 +167,7 @@ password_hash = hashlib.sha256(password.encode()).hexdigest()
 - **V-15**：容器新增非 root 用户 `appuser` 并以之运行；Compose 移除 `user: "0:0"` 与弱默认 `ADMIN_PASSWORD`/`JWT_SECRET_KEY`，新增 `SESSION_COOKIE_SECURE` 开关。
 - **V-16**：`get_table_data` 校验表名并对 `password_hash/value/password/token/secret/api_key` 列脱敏。
 - **V-17**：为卡券、备份导入等接口补 `except HTTPException: raise`，避免把 400/404 误转成 500。
+- **V-18/V-19**：`GET/PUT /system-settings` 由 `require_auth` 改为 `require_admin`，普通用户不再能读取（AI Key、SMTP 密码、QQ 秘钥等）或修改全局配置；前端同步将「系统与AI」入口限制为管理员可见。
 - 另外新增安全响应头（`X-Content-Type-Options: nosniff`、`X-Frame-Options`、`Referrer-Policy`、`Permissions-Policy`），并在会话校验时复查账号是否仍启用、权限是否被撤销（撤销即时生效）。
 
 ---
@@ -223,3 +226,44 @@ test_admin_data_table_sql_injection_rejected
 | `Dockerfile` / `Dockerfile-cn` / `docker-compose*.yml` | 非 root 运行、移除弱默认口令 |
 | `.gitignore` | 忽略安全测试临时产物 |
 | `tests/security/test_security_regressions.py` | 新增安全回归测试 |
+
+---
+
+## 7. 新增功能：在线更新（feature/online-update）
+
+在本次修复基础上新增「在线更新」功能，默认绑定到自有仓库
+`ByebyDoggy/xianyu-super-butler`（分支 `main`），可在系统设置中修改。
+
+### 使用方式
+
+1. 「系统设置 → 在线更新」填写仓库（`owner/name`）、分支，私有仓库可选填 GitHub Token；
+2. 点击「保存所有配置」后点击「检查更新」，展示当前版本、远端提交与是否需要更新；
+3. 点击「立即更新」执行更新（默认更新后自动重启，Docker 等由重启策略拉起）。
+
+### 接口
+
+| 接口 | 说明 | 权限 |
+| --- | --- | --- |
+| `GET /system/update/check` | 通过 GitHub API 检查最新提交 | 管理员 |
+| `POST /system/update/apply` | 执行更新（`restart`/`force` 可选） | 管理员 |
+
+### 实现与安全设计（`utils/updater.py`）
+
+- 优先使用 `git fetch` + `git merge --ff-only`（存在 `.git` 时），失败不会强改本地未提交修改；`force=true` 时才会 `git reset --hard`；
+- 非 Git 部署（如 Docker，`.git` 被 `.dockerignore` 排除）回退为下载 GitHub 源码 tarball 并覆盖项目文件；
+- **来源限制**：仓库/分支经严格正则校验，只允许配置的 `owner/name`，无法被改成任意 URL（防 SSRF）；
+- **命令注入防护**：所有子进程调用使用参数数组 + `shell=False`，并对分支名做白名单字符校验；
+- **归档安全**：解压前拒绝路径穿越、符号链接/硬链接/设备文件，防止写到项目目录之外；
+- **数据保护**：更新时跳过 `data/`、`logs/`、`backups/`、`static/uploads`、`global_config.yml`、`.env`、`node_modules`、虚拟环境等，不会覆盖运行数据与配置；
+- **鉴权**：接口仅管理员可用；Token 不写日志（并命中 SQL 日志脱敏规则）；
+- **可回滚**：Git 部署下为快进合并，保留完整提交历史，可随时 `git reset` 回退。
+
+> 注意：在线更新会用仓库中的代码覆盖程序文件，这本质上是一次受信任的代码分发，
+> 请确保该仓库由你可控；建议在更新前通过「检查更新」确认提交来源。
+
+### 相关测试
+
+`tests/security/test_security_regressions.py` 新增：
+`test_system_settings_requires_admin`、`test_update_endpoints_require_admin`、
+`test_update_repo_validation`、`test_update_protected_paths`、
+`test_check_update_rejects_bad_repo_without_network`。

@@ -8,6 +8,9 @@ entrypoint.sh text eol=lf
 # 确保Python文件使用Unix换行符(LF)
 *.py text eol=lf
 
+# 确保HTML文件使用Unix换行符(LF)
+*.html text eol=lf
+
 # 确保配置文件使用Unix换行符(LF)
 *.yml text eol=lf
 *.yaml text eol=lf
@@ -27,3 +30,6 @@ entrypoint.sh text eol=lf
 *.db binary
 *.sqlite binary
 *.sqlite3 binary
+
+# 前端构建产物按二进制处理，避免换行符转换破坏压缩文件
+static/assets/* binary

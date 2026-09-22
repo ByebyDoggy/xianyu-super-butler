@@ -509,7 +509,10 @@ class DBManager:
             ('qq_reply_secret_key', '', 'QQ回复消息API秘钥'),
             ('item_sync_enabled', 'true', '是否启用定时自动同步商品'),
             ('item_sync_interval', '600', '商品同步间隔时间（秒）'),
-            ('item_sync_max_pages', '5', '每次最多同步的页数')
+            ('item_sync_max_pages', '5', '每次最多同步的页数'),
+            ('github_repo', 'ByebyDoggy/xianyu-super-butler', '在线更新的 GitHub 仓库 (owner/name)'),
+            ('github_branch', 'main', '在线更新的 GitHub 分支'),
+            ('github_token', '', '访问私有仓库/提升限流用的 GitHub Token（可空）')
             ''')
 
             # 检查并升级数据库
