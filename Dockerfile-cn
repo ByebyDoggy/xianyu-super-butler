@@ -147,11 +147,15 @@ RUN playwright install chromium && \
 RUN mkdir -p /app/logs /app/data /app/backups /app/static/uploads/images && \
     chmod 777 /app/logs /app/data /app/backups /app/static/uploads /app/static/uploads/images
 
+# 创建非 root 运行用户（降低容器逃逸/提权风险）
+RUN groupadd -r appuser && useradd -r -g appuser -d /app -s /sbin/nologin appuser && \
+    chown -R appuser:appuser /app
+
 # 配置系统限制，防止core文件生成
 RUN echo "ulimit -c 0" >> /etc/profile
 
-# 注意: 为了简化权限问题，使用root用户运行
-# 在生产环境中，建议配置适当的用户映射
+# 以非 root 用户运行；如宿主机挂载目录权限不符，请在宿主机执行 chown -R 1000:1000 data logs
+USER appuser
 
 # 暴露端口
 EXPOSE 8080

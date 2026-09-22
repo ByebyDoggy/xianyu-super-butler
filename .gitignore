@@ -812,3 +812,12 @@ frontend/coverage/
 .spec-workflow
 .cursor
 .claude
+
+# 安全测试临时文件
+sec_tmp/
+.venv-test/
+.venv-sec/
+sec_bandit.*
+
+# 允许提交安全回归测试
+!tests/security/test_*.py

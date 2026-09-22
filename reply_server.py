@@ -1,9 +1,9 @@
-from fastapi import FastAPI, HTTPException, Depends, status, UploadFile, File, Form, Body, Query
+from fastapi import FastAPI, HTTPException, Depends, status, UploadFile, File, Form, Body, Query, Request
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse, StreamingResponse
 from fastapi import Response, Cookie
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, EmailStr
 from typing import List, Tuple, Optional, Dict, Any
 from pathlib import Path
 from urllib.parse import unquote
@@ -27,6 +27,13 @@ from ai_reply_engine import ai_reply_engine
 from utils.qr_login import qr_login_manager
 from utils.xianyu_utils import trans_cookies
 from utils.image_utils import image_manager
+from utils.rate_limit import (
+    login_limiter,
+    register_limiter,
+    email_code_limiter,
+    captcha_limiter,
+    client_ip,
+)
 
 from loguru import logger
 
@@ -132,15 +139,55 @@ def _get_session(session_id: str) -> Optional[Dict[str, Any]]:
             conn.commit()
             return None
 
+        # 校验账号仍然有效，并使用数据库中的最新权限（撤销即时生效）
+        cursor.execute("SELECT is_active, is_admin FROM users WHERE id = ?", (int(row[1]),))
+        account = cursor.fetchone()
+        if not account or not account[0]:
+            cursor.execute("DELETE FROM sessions WHERE session_id = ?", (session_id,))
+            conn.commit()
+            return None
+
         return {
             'session_id': row[0],
             'user_id': int(row[1]),
             'username': row[2],
-            'is_admin': bool(row[3]),
+            'is_admin': bool(account[1]),
             'timestamp': float(now),
         }
     finally:
         conn.close()
+
+
+def _session_cookie_secure(request: Request) -> bool:
+    """判断会话 Cookie 是否应设置 Secure 标记。
+
+    优先级：SESSION_COOKIE_SECURE 环境变量 > 请求协议（含反向代理 X-Forwarded-Proto）。
+    """
+    env = os.getenv("SESSION_COOKIE_SECURE", "").strip().lower()
+    if env in ("1", "true", "yes", "on"):
+        return True
+    if env in ("0", "false", "no", "off"):
+        return False
+    try:
+        proto = request.headers.get("x-forwarded-proto", "") or request.url.scheme
+        return proto.split(",")[0].strip().lower() == "https"
+    except Exception:
+        return False
+
+
+def _session_response(payload: Dict[str, Any], session_id: str, request: Request) -> JSONResponse:
+    """构造带会话 Cookie 的响应"""
+    resp = JSONResponse(content=payload)
+    resp.set_cookie(
+        key=SESSION_COOKIE_NAME,
+        value=session_id,
+        httponly=True,
+        samesite='lax',
+        secure=_session_cookie_secure(request),
+        max_age=SESSION_EXPIRE_SECONDS,
+        path='/',
+    )
+    return resp
 
 
 def get_current_user_from_session_cookie(session: Optional[str] = Cookie(default=None, alias=SESSION_COOKIE_NAME)) -> Optional[Dict[str, Any]]:
@@ -215,7 +262,7 @@ KEYWORDS_MAPPING = load_keywords()
 class LoginRequest(BaseModel):
     username: Optional[str] = None
     password: Optional[str] = None
-    email: Optional[str] = None
+    email: Optional[EmailStr] = None
     verification_code: Optional[str] = None
 
 
@@ -235,7 +282,7 @@ class ChangePasswordRequest(BaseModel):
 
 class RegisterRequest(BaseModel):
     username: str
-    email: str
+    email: EmailStr
     password: str
     verification_code: str
 
@@ -246,7 +293,7 @@ class RegisterResponse(BaseModel):
 
 
 class SendCodeRequest(BaseModel):
-    email: str
+    email: EmailStr
     session_id: Optional[str] = None
     type: Optional[str] = 'register'  # 'register' 或 'login'
 
@@ -437,6 +484,16 @@ async def log_requests(request, call_next):
 
     return response
 
+# 安全响应头中间件
+@app.middleware("http")
+async def add_security_headers(request, call_next):
+    response = await call_next(request)
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "SAMEORIGIN")
+    response.headers.setdefault("Referrer-Policy", "no-referrer")
+    response.headers.setdefault("Permissions-Policy", "geolocation=(), microphone=(), camera=()")
+    return response
+
 # 提供前端静态文件
 import os
 static_dir = os.path.join(os.path.dirname(__file__), 'static')
@@ -578,23 +635,30 @@ async def register_page():
 
 # 登录接口
 @app.post('/login')
-async def login(request: LoginRequest):
+async def login(login_data: LoginRequest, request: Request):
     from db_manager import db_manager
 
+    ip = client_ip(request)
+    if not login_limiter.allow("login", ip):
+        logger.warning(f"登录请求过于频繁，已限流: {ip}")
+        raise HTTPException(status_code=429, detail="尝试过于频繁，请稍后再试")
+
     # 判断登录方式
-    if request.username and request.password:
+    if login_data.username and login_data.password:
         # 用户名/密码登录
-        logger.info(f"【{request.username}】尝试用户名登录")
+        logger.info(f"【{login_data.username}】尝试用户名登录")
 
         # 统一使用用户表验证（包括admin用户）
-        if db_manager.verify_user_password(request.username, request.password):
-            user = db_manager.get_user_by_username(request.username)
+        if db_manager.verify_user_password(login_data.username, login_data.password):
+            user = db_manager.get_user_by_username(login_data.username)
             if user:
+                login_limiter.reset("login", ip)
+                is_admin = bool(user.get('is_admin', False)) or user['username'] == ADMIN_USERNAME
                 # 创建 Cookie Session
                 session_id = _create_session({
                     'id': user['id'],
                     'username': user['username'],
-                    'is_admin': bool(user.get('is_admin', False)) or user['username'] == ADMIN_USERNAME,
+                    'is_admin': is_admin,
                 })
 
                 # 区分管理员和普通用户的日志
@@ -603,119 +667,93 @@ async def login(request: LoginRequest):
                 else:
                     logger.info(f"【{user['username']}#{user['id']}】登录成功")
 
-                resp = JSONResponse(content=LoginResponse(
+                return _session_response(LoginResponse(
                     success=True,
                     token=None,
                     message="登录成功",
                     user_id=user['id'],
                     username=user['username'],
-                    is_admin=bool(user.get('is_admin', False)) or user['username'] == ADMIN_USERNAME
-                ).model_dump())
-                resp.set_cookie(
-                    key=SESSION_COOKIE_NAME,
-                    value=session_id,
-                    httponly=True,
-                    samesite='lax',
-                    secure=False,
-                    max_age=SESSION_EXPIRE_SECONDS,
-                    path='/',
-                )
-                return resp
+                    is_admin=is_admin
+                ).model_dump(), session_id, request)
 
-        logger.warning(f"【{request.username}】登录失败：用户名或密码错误")
+        logger.warning(f"【{login_data.username}】登录失败：用户名或密码错误")
         return LoginResponse(
             success=False,
             message="用户名或密码错误"
         )
 
-    elif request.email and request.password:
+    elif login_data.email and login_data.password:
         # 邮箱/密码登录
-        logger.info(f"【{request.email}】尝试邮箱密码登录")
+        logger.info(f"【{login_data.email}】尝试邮箱密码登录")
 
-        user = db_manager.get_user_by_email(request.email)
-        if user and db_manager.verify_user_password(user['username'], request.password):
+        user = db_manager.get_user_by_email(login_data.email)
+        if user and db_manager.verify_user_password(user['username'], login_data.password):
+            login_limiter.reset("login", ip)
+            is_admin = bool(user.get('is_admin', False)) or user['username'] == ADMIN_USERNAME
             # 创建 Cookie Session
             session_id = _create_session({
                 'id': user['id'],
                 'username': user['username'],
-                'is_admin': bool(user.get('is_admin', False)) or user['username'] == ADMIN_USERNAME,
+                'is_admin': is_admin,
             })
 
             logger.info(f"【{user['username']}#{user['id']}】邮箱登录成功")
 
-            resp = JSONResponse(content=LoginResponse(
+            return _session_response(LoginResponse(
                 success=True,
                 token=None,
                 message="登录成功",
                 user_id=user['id'],
                 username=user['username'],
-                is_admin=bool(user.get('is_admin', False)) or user['username'] == ADMIN_USERNAME
-            ).model_dump())
-            resp.set_cookie(
-                key=SESSION_COOKIE_NAME,
-                value=session_id,
-                httponly=True,
-                samesite='lax',
-                secure=False,
-                max_age=SESSION_EXPIRE_SECONDS,
-                path='/',
-            )
-            return resp
+                is_admin=is_admin
+            ).model_dump(), session_id, request)
 
-        logger.warning(f"【{request.email}】邮箱登录失败：邮箱或密码错误")
+        logger.warning(f"【{login_data.email}】邮箱登录失败：邮箱或密码错误")
         return LoginResponse(
             success=False,
             message="邮箱或密码错误"
         )
 
-    elif request.email and request.verification_code:
+    elif login_data.email and login_data.verification_code:
         # 邮箱/验证码登录
-        logger.info(f"【{request.email}】尝试邮箱验证码登录")
+        logger.info(f"【{login_data.email}】尝试邮箱验证码登录")
 
         # 验证邮箱验证码
-        if not db_manager.verify_email_code(request.email, request.verification_code, 'login'):
-            logger.warning(f"【{request.email}】验证码登录失败：验证码错误或已过期")
+        if not db_manager.verify_email_code(login_data.email, login_data.verification_code, 'login'):
+            logger.warning(f"【{login_data.email}】验证码登录失败：验证码错误或已过期")
             return LoginResponse(
                 success=False,
                 message="验证码错误或已过期"
             )
 
         # 获取用户信息
-        user = db_manager.get_user_by_email(request.email)
+        user = db_manager.get_user_by_email(login_data.email)
         if not user:
-            logger.warning(f"【{request.email}】验证码登录失败：用户不存在")
+            logger.warning(f"【{login_data.email}】验证码登录失败：用户不存在")
             return LoginResponse(
                 success=False,
                 message="用户不存在"
             )
 
+        login_limiter.reset("login", ip)
+        is_admin = bool(user.get('is_admin', False)) or user['username'] == ADMIN_USERNAME
         # 创建 Cookie Session
         session_id = _create_session({
             'id': user['id'],
             'username': user['username'],
-            'is_admin': bool(user.get('is_admin', False)) or user['username'] == ADMIN_USERNAME,
+            'is_admin': is_admin,
         })
 
         logger.info(f"【{user['username']}#{user['id']}】验证码登录成功")
 
-        resp = JSONResponse(content=LoginResponse(
+        return _session_response(LoginResponse(
             success=True,
             token=None,
             message="登录成功",
             user_id=user['id'],
             username=user['username'],
-            is_admin=bool(user.get('is_admin', False)) or user['username'] == ADMIN_USERNAME
-        ).model_dump())
-        resp.set_cookie(
-            key=SESSION_COOKIE_NAME,
-            value=session_id,
-            httponly=True,
-            samesite='lax',
-            secure=False,
-            max_age=SESSION_EXPIRE_SECONDS,
-            path='/',
-        )
-        return resp
+            is_admin=is_admin
+        ).model_dump(), session_id, request)
 
     else:
         return LoginResponse(
@@ -820,8 +858,11 @@ async def check_default_password(current_user: Dict[str, Any] = Depends(get_curr
 
 # 生成图形验证码接口
 @app.post('/generate-captcha')
-async def generate_captcha(request: CaptchaRequest):
+async def generate_captcha(request: CaptchaRequest, http_request: Request):
     from db_manager import db_manager
+
+    if not captcha_limiter.allow("captcha", client_ip(http_request)):
+        raise HTTPException(status_code=429, detail="请求过于频繁，请稍后再试")
 
     try:
         # 生成图形验证码
@@ -863,8 +904,11 @@ async def generate_captcha(request: CaptchaRequest):
 
 # 验证图形验证码接口
 @app.post('/verify-captcha')
-async def verify_captcha(request: VerifyCaptchaRequest):
+async def verify_captcha(request: VerifyCaptchaRequest, http_request: Request):
     from db_manager import db_manager
+
+    if not captcha_limiter.allow("captcha", client_ip(http_request)):
+        raise HTTPException(status_code=429, detail="请求过于频繁，请稍后再试")
 
     try:
         if db_manager.verify_captcha(request.session_id, request.captcha_code):
@@ -1063,8 +1107,13 @@ async def geetest_validate(request: GeetestValidateRequest):
 
 # 发送验证码接口（需要先验证图形验证码）
 @app.post('/send-verification-code')
-async def send_verification_code(request: SendCodeRequest):
+async def send_verification_code(request: SendCodeRequest, http_request: Request):
     from db_manager import db_manager
+
+    ip = client_ip(http_request)
+    if not email_code_limiter.allow("email_code", ip):
+        logger.warning(f"验证码发送过于频繁，已限流: {ip}")
+        raise HTTPException(status_code=429, detail="发送过于频繁，请稍后再试")
 
     try:
         # 检查是否已验证图形验证码
@@ -1131,8 +1180,13 @@ async def send_verification_code(request: SendCodeRequest):
 
 # 用户注册接口
 @app.post('/register')
-async def register(request: RegisterRequest):
+async def register(request: RegisterRequest, http_request: Request):
     from db_manager import db_manager
+
+    ip = client_ip(http_request)
+    if not register_limiter.allow("register", ip):
+        logger.warning(f"注册请求过于频繁，已限流: {ip}")
+        raise HTTPException(status_code=429, detail="注册过于频繁，请稍后再试")
 
     # 检查注册是否开启
     registration_enabled = db_manager.get_system_setting('registration_enabled')
@@ -1222,7 +1276,9 @@ def verify_api_key(api_key: str) -> bool:
             logger.error("qq_reply_secret_key 未配置，拒绝请求")
             return False
 
-        return api_key == qq_secret_key
+        # 使用恒定时间比较，避免时序侧信道
+        import hmac as _hmac
+        return _hmac.compare_digest(str(api_key), str(qq_secret_key))
     except Exception as e:
         logger.error(f"验证API秘钥时发生异常: {e}")
         return False
@@ -1256,7 +1312,7 @@ async def send_message_api(request: SendMessageRequest):
 
         # 验证API秘钥
         if not verify_api_key(cleaned_api_key):
-            logger.warning(f"API秘钥验证失败: {cleaned_api_key}")
+            logger.warning("API秘钥验证失败")
             return SendMessageResponse(
                 success=False,
                 message="API秘钥验证失败"
@@ -4047,13 +4103,15 @@ def get_card(card_id: int, current_user: Dict[str, Any] = Depends(get_current_us
             return card
         else:
             raise HTTPException(status_code=404, detail="卡券不存在")
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.put("/cards/{card_id}")
-def update_card(card_id: int, card_data: dict, _: None = Depends(require_auth)):
-    """更新卡券"""
+def update_card(card_id: int, card_data: dict, current_user: Dict[str, Any] = Depends(get_current_user)):
+    """更新卡券（仅限本人卡券）"""
     try:
         from db_manager import db_manager
         # 验证多规格字段
@@ -4075,12 +4133,15 @@ def update_card(card_id: int, card_data: dict, _: None = Depends(require_auth)):
             delay_seconds=card_data.get('delay_seconds'),
             is_multi_spec=is_multi_spec,
             spec_name=card_data.get('spec_name'),
-            spec_value=card_data.get('spec_value')
+            spec_value=card_data.get('spec_value'),
+            user_id=current_user['user_id']
         )
         if success:
             return {"message": "卡券更新成功"}
         else:
             raise HTTPException(status_code=404, detail="卡券不存在")
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -4137,7 +4198,8 @@ async def update_card_with_image(
             delay_seconds=delay_seconds,
             is_multi_spec=is_multi_spec,
             spec_name=spec_name if is_multi_spec else None,
-            spec_value=spec_value if is_multi_spec else None
+            spec_value=spec_value if is_multi_spec else None,
+            user_id=current_user['user_id']
         )
 
         if success:
@@ -4226,15 +4288,17 @@ def update_delivery_rule(rule_id: int, rule_data: dict, current_user: Dict[str, 
 
 
 @app.delete("/cards/{card_id}")
-def delete_card(card_id: int, _: None = Depends(require_auth)):
-    """删除卡券"""
+def delete_card(card_id: int, current_user: Dict[str, Any] = Depends(get_current_user)):
+    """删除卡券（仅限本人卡券）"""
     try:
         from db_manager import db_manager
-        success = db_manager.delete_card(card_id)
+        success = db_manager.delete_card(card_id, user_id=current_user['user_id'])
         if success:
             return {"message": "卡券删除成功"}
         else:
             raise HTTPException(status_code=404, detail="卡券不存在")
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -4315,6 +4379,8 @@ def import_backup(file: UploadFile = File(...), current_user: Dict[str, Any] = D
 
     except json.JSONDecodeError:
         raise HTTPException(status_code=400, detail="备份文件格式无效")
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"导入备份失败: {str(e)}")
 

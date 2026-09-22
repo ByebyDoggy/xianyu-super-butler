@@ -6,8 +6,6 @@ services:
     image: xianyu-auto-reply:latest
     container_name: xianyu-auto-reply
     restart: unless-stopped
-    # 使用root用户避免权限问题
-    user: "0:0"
     ports:
       - "${WEB_PORT:-8080}:8080"
     volumes:
@@ -31,8 +29,8 @@ services:
       - SQL_LOG_ENABLED=${SQL_LOG_ENABLED:-true}
       - SQL_LOG_LEVEL=${SQL_LOG_LEVEL:-INFO}
       - ADMIN_USERNAME=${ADMIN_USERNAME:-admin}
-      - ADMIN_PASSWORD=${ADMIN_PASSWORD:-admin123}
-      - JWT_SECRET_KEY=${JWT_SECRET_KEY:-default-secret-key}
+      # 安全：会话 Cookie 的 Secure 标记（HTTPS 部署时请设为 true）
+      - SESSION_COOKIE_SECURE=${SESSION_COOKIE_SECURE:-false}
       - SESSION_TIMEOUT=${SESSION_TIMEOUT:-3600}
       # 多用户系统配置
       - MULTIUSER_ENABLED=${MULTIUSER_ENABLED:-true}

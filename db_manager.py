@@ -2,9 +2,12 @@ import sqlite3
 import os
 import threading
 import hashlib
+import hmac
 import time
 import json
 import random
+import re
+import secrets
 import string
 import aiohttp
 import io
@@ -503,7 +506,7 @@ class DBManager:
             ('smtp_from', '', '发件人显示名（留空则使用用户名）'),
             ('smtp_use_tls', 'true', '是否启用TLS'),
             ('smtp_use_ssl', 'false', '是否启用SSL'),
-            ('qq_reply_secret_key', 'xianyu_qq_reply_2024', 'QQ回复消息API秘钥'),
+            ('qq_reply_secret_key', '', 'QQ回复消息API秘钥'),
             ('item_sync_enabled', 'true', '是否启用定时自动同步商品'),
             ('item_sync_interval', '600', '商品同步间隔时间（秒）'),
             ('item_sync_max_pages', '5', '每次最多同步的页数')
@@ -511,6 +514,9 @@ class DBManager:
 
             # 检查并升级数据库
             self.check_and_upgrade_db(cursor)
+
+            # 确保 QQ 回复 API 秘钥为强随机值（兼容历史硬编码默认值）
+            self._ensure_qq_reply_secret_key(cursor)
 
             # 执行数据库迁移
             self._migrate_database(cursor)
@@ -521,6 +527,34 @@ class DBManager:
             logger.error(f"数据库初始化失败: {e}")
             self.conn.rollback()
             raise
+
+    # 历史版本泄漏过的硬编码默认密钥，首次初始化/升级时强制轮换
+    _LEGACY_QQ_SECRETS = {'xianyu_qq_reply_2024'}
+
+    def _ensure_qq_reply_secret_key(self, cursor):
+        """确保 QQ 回复 API 秘钥为强随机值，并轮换历史硬编码默认值。"""
+        try:
+            cursor.execute(
+                "SELECT value FROM system_settings WHERE key = 'qq_reply_secret_key'"
+            )
+            row = cursor.fetchone()
+            current = (row[0] if row and row[0] is not None else '') or ''
+
+            if not current or current in self._LEGACY_QQ_SECRETS:
+                new_secret = secrets.token_urlsafe(32)
+                cursor.execute(
+                    "INSERT INTO system_settings (key, value, description) VALUES ('qq_reply_secret_key', ?, 'QQ回复消息API秘钥') "
+                    "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    (new_secret,),
+                )
+                if current in self._LEGACY_QQ_SECRETS:
+                    logger.warning(
+                        "检测到不安全的默认 QQ回复秘钥，已自动轮换为强随机值，请在系统设置中查看/更新"
+                    )
+                else:
+                    logger.info("已为 QQ回复API 生成随机秘钥")
+        except Exception as e:
+            logger.error(f"初始化 QQ回复秘钥失败: {e}")
 
     def _migrate_database(self, cursor):
         """执行数据库迁移"""
@@ -1090,20 +1124,30 @@ class DBManager:
             self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
         return self.conn
 
+    # 日志中需要脱敏的字段（避免密码哈希/Cookie/秘钥等写入日志）
+    _SENSITIVE_SQL_KEYWORDS = (
+        'password_hash', 'password', 'cookie', 'token', 'secret', 'api_key', 'apikey',
+    )
+
     def _log_sql(self, sql: str, params: tuple = None, operation: str = "EXECUTE"):
-        """记录SQL执行日志"""
+        """记录SQL执行日志（对敏感参数脱敏）"""
         if not self.sql_log_enabled:
             return
+
+        sql_lower = sql.lower()
+        sql_touches_sensitive = any(k in sql_lower for k in self._SENSITIVE_SQL_KEYWORDS)
 
         # 格式化参数
         params_str = ""
         if params:
             if isinstance(params, (list, tuple)):
                 if len(params) > 0:
-                    # 限制参数长度，避免日志过长
+                    # 限制参数长度，避免日志过长；命中敏感字段时统一脱敏
                     formatted_params = []
                     for param in params:
-                        if isinstance(param, str) and len(param) > 100:
+                        if sql_touches_sensitive:
+                            formatted_params.append("***")
+                        elif isinstance(param, str) and len(param) > 100:
                             formatted_params.append(f"{param[:100]}...")
                         else:
                             formatted_params.append(repr(param))
@@ -2333,33 +2377,66 @@ class DBManager:
                 logger.error(f"导出备份失败: {e}")
                 raise
 
+    # 允许通过备份导入的表（系统级）
+    _SYSTEM_IMPORT_TABLES = {
+        'cookies', 'keywords', 'cookie_status', 'cards', 'delivery_rules',
+        'default_replies', 'notification_channels', 'message_notifications',
+        'system_settings', 'item_info', 'ai_reply_settings', 'ai_conversations',
+        'ai_item_cache',
+    }
+    # 普通用户备份导入允许的表（不包含任何全局/系统表）
+    _USER_IMPORT_TABLES = _SYSTEM_IMPORT_TABLES - {'system_settings', 'notification_channels'}
+
+    def _get_table_columns(self, cursor, table_name: str):
+        """获取表的真实列名"""
+        cursor.execute(f"PRAGMA table_info({table_name})")
+        return [row[1] for row in cursor.fetchall()]
+
     def import_backup(self, backup_data: Dict[str, any], user_id: int = None) -> bool:
-        """导入系统备份数据（支持用户隔离）"""
+        """导入系统备份数据（支持用户隔离）
+
+        安全加固：
+        - 仅允许白名单表；
+        - 列名必须真实存在于目标表（防止通过列名拼接 SQL 注入）；
+        - 行宽必须与列数一致；
+        - 用户级导入禁止写入 system_settings / notification_channels 等全局表；
+        - 用户级导入强制 user_id，并校验 cookie_id 归属。
+        """
         with self.lock:
             try:
                 # 验证备份数据格式
-                if not isinstance(backup_data, dict) or 'data' not in backup_data:
+                if not isinstance(backup_data, dict) or not isinstance(backup_data.get('data'), dict):
                     raise ValueError("备份数据格式无效")
 
-                # 开始事务
+                allowed_tables = self._USER_IMPORT_TABLES if user_id is not None else self._SYSTEM_IMPORT_TABLES
+                data = backup_data['data']
+
                 cursor = self.conn.cursor()
                 self._execute_sql(cursor, "BEGIN TRANSACTION")
 
+                # 计算导入后该用户拥有的 cookie_id 集合（用于校验 cookie_id 归属）
+                owned_cookie_ids = set()
                 if user_id is not None:
-                    # 用户级导入：只清空该用户的数据
-                    # 获取用户的cookie_id列表
                     self._execute_sql(cursor, "SELECT id FROM cookies WHERE user_id = ?", (user_id,))
-                    user_cookie_ids = [row[0] for row in cursor.fetchall()]
+                    existing_cookie_ids = [row[0] for row in cursor.fetchall()]
 
-                    if user_cookie_ids:
-                        placeholders = ','.join(['?' for _ in user_cookie_ids])
+                    cookies_data = data.get('cookies')
+                    if isinstance(cookies_data, dict) and 'id' in (cookies_data.get('columns') or []):
+                        idx = cookies_data['columns'].index('id')
+                        for r in cookies_data.get('rows') or []:
+                            if isinstance(r, (list, tuple)) and len(r) > idx:
+                                owned_cookie_ids.add(r[idx])
+
+                    # 用户级导入：只清空该用户的数据
+                    if existing_cookie_ids:
+                        placeholders = ','.join(['?' for _ in existing_cookie_ids])
 
                         # 删除用户相关数据
                         related_tables = ['message_notifications', 'default_replies', 'item_info',
                                         'cookie_status', 'keywords', 'ai_conversations', 'ai_reply_settings']
 
                         for table in related_tables:
-                            cursor.execute(f"DELETE FROM {table} WHERE cookie_id IN ({placeholders})", user_cookie_ids)
+                            cursor.execute(f"DELETE FROM {table} WHERE cookie_id IN ({placeholders})", existing_cookie_ids)
 
                         # 删除用户的cookies
                         self._execute_sql(cursor, "DELETE FROM cookies WHERE user_id = ?", (user_id,))
@@ -2378,40 +2455,69 @@ class DBManager:
                     self._execute_sql(cursor, "DELETE FROM system_settings WHERE key != 'admin_password_hash'")
 
                 # 导入数据
-                data = backup_data['data']
                 for table_name, table_data in data.items():
-                    if table_name not in ['cookies', 'keywords', 'cookie_status', 'cards',
-                                        'delivery_rules', 'default_replies', 'notification_channels',
-                                        'message_notifications', 'system_settings', 'item_info',
-                                        'ai_reply_settings', 'ai_conversations', 'ai_item_cache']:
+                    if not isinstance(table_name, str) or table_name not in allowed_tables:
+                        logger.warning(f"备份导入：跳过不允许的表 {table_name}")
+                        continue
+                  
+                    # 表名必须是数据库中真实存在的表（防止表名拼接注入）
+                    self._validate_table_name(table_name)
+
+                    if not isinstance(table_data, dict):
+                        raise ValueError(f"表 {table_name} 的备份数据格式无效")
+
+                    columns = table_data.get('columns')
+                    rows = table_data.get('rows')
+                    if not isinstance(columns, list) or not columns:
+                        continue
+                    if not all(isinstance(c, str) for c in columns):
+                        raise ValueError(f"表 {table_name} 的列名无效")
+                    if len(set(columns)) != len(columns):
+                        raise ValueError(f"表 {table_name} 的列名重复")
+
+                    # 列名必须真实存在于表中，否则可能被用于 SQL 注入
+                    table_columns = self._get_table_columns(cursor, table_name)
+                    unknown = [c for c in columns if c not in table_columns]
+                    if unknown:
+                        raise ValueError(f"表 {table_name} 存在非法列名: {unknown}")
+
+                    if not isinstance(rows, list) or not rows:
                         continue
 
-                    columns = table_data['columns']
-                    rows = table_data['rows']
+                    # 用户级导入：强制 user_id，并校验 cookie_id 归属
+                    col_index = {name: i for i, name in enumerate(columns)}
+                    if user_id is not None:
+                        if 'user_id' in col_index:
+                            i = col_index['user_id']
+                            rows = [[user_id if j == i else v for j, v in enumerate(r)] for r in rows]
+                        elif 'user_id' in table_columns:
+                            columns = columns + ['user_id']
+                            col_index['user_id'] = len(columns) - 1
+                            rows = [list(r) + [user_id] for r in rows]
 
-                    if not rows:
-                        continue
+                    cookie_idx = col_index.get('cookie_id')
 
-                    # 如果是用户级导入，需要确保cookies表的user_id正确
-                    if user_id is not None and table_name == 'cookies':
-                        # 更新所有导入的cookies的user_id
-                        updated_rows = []
-                        for row in rows:
-                            row_dict = dict(zip(columns, row))
-                            row_dict['user_id'] = user_id
-                            updated_rows.append([row_dict[col] for col in columns])
-                        rows = updated_rows
+                    normalized_rows = []
+                    for r in rows:
+                        if isinstance(r, tuple):
+                            r = list(r)
+                        if not isinstance(r, list) or len(r) != len(columns):
+                            raise ValueError(f"表 {table_name} 的行数据宽度与列数不一致")
+                        if cookie_idx is not None and r[cookie_idx] not in owned_cookie_ids:
+                            raise ValueError(f"表 {table_name} 引用了不属于当前账号的 cookie_id")
+                        normalized_rows.append(r)
 
-                    # 构建插入语句
+                    # 构建插入语句（列名已校验，参数仍使用占位符）
                     placeholders = ','.join(['?' for _ in columns])
+                    column_sql = ','.join(columns)
 
                     if table_name == 'system_settings':
                         # 系统设置需要特殊处理，避免覆盖管理员密码
-                        for row in rows:
+                        for row in normalized_rows:
                             if len(row) >= 1 and row[0] != 'admin_password_hash':
-                                cursor.execute(f"INSERT INTO {table_name} ({','.join(columns)}) VALUES ({placeholders})", row)
+                                cursor.execute(f"INSERT INTO {table_name} ({column_sql}) VALUES ({placeholders})", row)
                     else:
-                        cursor.executemany(f"INSERT INTO {table_name} ({','.join(columns)}) VALUES ({placeholders})", rows)
+                        cursor.executemany(f"INSERT INTO {table_name} ({column_sql}) VALUES ({placeholders})", normalized_rows)
 
                 # 提交事务
                 self.conn.commit()
@@ -2471,6 +2577,46 @@ class DBManager:
 
     # 管理员密码现在统一使用用户表管理，不再需要单独的方法
 
+    # ==================== 密码哈希 ====================
+    # 采用 PBKDF2-HMAC-SHA256 + 随机盐；旧的无盐 SHA-256 记录在首次成功登录时自动升级。
+    PBKDF2_ITERATIONS = 600_000
+    PBKDF2_PREFIX = "pbkdf2_sha256"
+
+    @classmethod
+    def _hash_password(cls, password: str) -> str:
+        """生成 PBKDF2-HMAC-SHA256 密码哈希"""
+        salt = secrets.token_bytes(16)
+        dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, cls.PBKDF2_ITERATIONS)
+        return f"{cls.PBKDF2_PREFIX}${cls.PBKDF2_ITERATIONS}${salt.hex()}${dk.hex()}"
+
+    @classmethod
+    def _verify_password_hash(cls, password: str, stored_hash: str) -> bool:
+        """校验密码；兼容旧版无盐 SHA-256 哈希"""
+        if not stored_hash:
+            return False
+
+        if stored_hash.startswith(cls.PBKDF2_PREFIX + "$"):
+            try:
+                _, iterations, salt_hex, hash_hex = stored_hash.split("$", 3)
+                dk = hashlib.pbkdf2_hmac(
+                    "sha256", password.encode("utf-8"), bytes.fromhex(salt_hex), int(iterations)
+                )
+                return hmac.compare_digest(dk.hex(), hash_hex)
+            except (ValueError, TypeError):
+                return False
+
+        # 旧格式：无盐 SHA-256 hex
+        if len(stored_hash) == 64:
+            legacy = hashlib.sha256(password.encode("utf-8")).hexdigest()
+            return hmac.compare_digest(legacy, stored_hash)
+
+        return False
+
+    @classmethod
+    def _needs_rehash(cls, stored_hash: str) -> bool:
+        """判断存量哈希是否需要升级到 PBKDF2"""
+        return not (stored_hash or "").startswith(cls.PBKDF2_PREFIX + "$")
+
     # ==================== 用户管理方法 ====================
 
     def create_user(self, username: str, email: str, password: str) -> bool:
@@ -2478,7 +2624,7 @@ class DBManager:
         with self.lock:
             try:
                 cursor = self.conn.cursor()
-                password_hash = hashlib.sha256(password.encode()).hexdigest()
+                password_hash = self._hash_password(password)
 
                 cursor.execute('''
                 INSERT INTO users (username, email, password_hash)
@@ -2552,20 +2698,36 @@ class DBManager:
                 return None
 
     def verify_user_password(self, username: str, password: str) -> bool:
-        """验证用户密码"""
+        """验证用户密码（兼容旧版 SHA-256，并在成功时自动升级为 PBKDF2）"""
         user = self.get_user_by_username(username)
         if not user:
             return False
 
-        password_hash = hashlib.sha256(password.encode()).hexdigest()
-        return user['password_hash'] == password_hash and user['is_active']
+        if not self._verify_password_hash(password, user['password_hash']):
+            return False
+
+        # 登录成功且为旧格式哈希时，透明升级
+        if user.get('is_active') and self._needs_rehash(user['password_hash']):
+            try:
+                with self.lock:
+                    cursor = self.conn.cursor()
+                    cursor.execute(
+                        "UPDATE users SET password_hash = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                        (self._hash_password(password), user['id']),
+                    )
+                    self.conn.commit()
+                logger.info(f"用户 {username} 的密码哈希已升级为 PBKDF2")
+            except Exception as e:
+                logger.warning(f"升级用户 {username} 密码哈希失败: {e}")
+
+        return bool(user.get('is_active'))
 
     def update_user_password(self, username: str, new_password: str) -> bool:
         """更新用户密码"""
         with self.lock:
             try:
                 cursor = self.conn.cursor()
-                password_hash = hashlib.sha256(new_password.encode()).hexdigest()
+                password_hash = self._hash_password(new_password)
 
                 cursor.execute('''
                 UPDATE users SET password_hash = ?, updated_at = CURRENT_TIMESTAMP
@@ -2586,17 +2748,17 @@ class DBManager:
                 return False
 
     def generate_verification_code(self) -> str:
-        """生成6位数字验证码"""
-        return ''.join(random.choices(string.digits, k=6))
+        """生成6位数字验证码（使用密码学安全随机数）"""
+        return ''.join(secrets.choice(string.digits) for _ in range(6))
 
     def generate_captcha(self) -> Tuple[str, str]:
         """生成图形验证码
         返回: (验证码文本, base64编码的图片)
         """
         try:
-            # 生成4位随机验证码（数字+字母）
+            # 生成4位随机验证码（数字+字母，使用密码学安全随机数）
             chars = string.ascii_uppercase + string.digits
-            captcha_text = ''.join(random.choices(chars, k=4))
+            captcha_text = ''.join(secrets.choice(chars) for _ in range(4))
 
             # 创建图片
             width, height = 120, 40
@@ -2652,7 +2814,7 @@ class DBManager:
         except Exception as e:
             logger.error(f"生成图形验证码失败: {e}")
             # 返回简单的文本验证码作为备用
-            simple_code = ''.join(random.choices(string.digits, k=4))
+            simple_code = ''.join(secrets.choice(string.digits) for _ in range(4))
             return simple_code, ""
 
     def save_captcha(self, session_id: str, captcha_text: str, expires_minutes: int = 5) -> bool:
@@ -3063,8 +3225,8 @@ class DBManager:
                    api_config=None, text_content: str = None, data_content: str = None,
                    image_url: str = None, description: str = None, enabled: bool = None,
                    delay_seconds: int = None, is_multi_spec: bool = None, spec_name: str = None,
-                   spec_value: str = None):
-        """更新卡券"""
+                   spec_value: str = None, user_id: int = None):
+        """更新卡券（传入 user_id 时同时校验归属，防止越权修改）"""
         with self.lock:
             try:
                 # 处理api_config参数
@@ -3126,6 +3288,9 @@ class DBManager:
                 params.append(card_id)
 
                 sql = f"UPDATE cards SET {', '.join(update_fields)} WHERE id = ?"
+                if user_id is not None:
+                    sql += " AND user_id = ?"
+                    params.append(user_id)
                 self._execute_sql(cursor, sql, params)
 
                 if cursor.rowcount > 0:
@@ -3544,12 +3709,15 @@ class DBManager:
                 logger.error(f"获取发货规则失败: {e}")
                 return []
 
-    def delete_card(self, card_id: int):
-        """删除卡券"""
+    def delete_card(self, card_id: int, user_id: int = None):
+        """删除卡券（传入 user_id 时同时校验归属，防止越权删除）"""
         with self.lock:
             try:
                 cursor = self.conn.cursor()
-                self._execute_sql(cursor, "DELETE FROM cards WHERE id = ?", (card_id,))
+                if user_id is not None:
+                    self._execute_sql(cursor, "DELETE FROM cards WHERE id = ? AND user_id = ?", (card_id, user_id))
+                else:
+                    self._execute_sql(cursor, "DELETE FROM cards WHERE id = ?", (card_id,))
 
                 if cursor.rowcount > 0:
                     self.conn.commit()
@@ -4424,10 +4592,28 @@ class DBManager:
                 logger.error(f"删除用户及相关数据失败: {e}")
                 return False
 
+    # 数据管理接口中需要脱敏展示的列
+    _SENSITIVE_DATA_COLUMNS = {'password_hash', 'password', 'value', 'token', 'secret', 'api_key'}
+
+    def _get_table_names(self):
+        """返回当前数据库中真实存在的表名集合"""
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        return {row[0] for row in cursor.fetchall()}
+
+    def _validate_table_name(self, table_name: str) -> str:
+        """校验表名，防止通过表名拼接 SQL"""
+        if not isinstance(table_name, str) or not re.fullmatch(r'[A-Za-z0-9_]+', table_name or ''):
+            raise ValueError('非法的表名')
+        if table_name not in self._get_table_names():
+            raise ValueError(f'表不存在: {table_name}')
+        return table_name
+
     def get_table_data(self, table_name: str):
         """获取指定表的所有数据"""
         with self.lock:
             try:
+                table_name = self._validate_table_name(table_name)
                 cursor = self.conn.cursor()
 
                 # 获取表结构
@@ -4444,11 +4630,18 @@ class DBManager:
                 for row in rows:
                     row_dict = {}
                     for i, value in enumerate(row):
-                        row_dict[columns[i]] = value
+                        col_name = columns[i]
+                        if col_name in self._SENSITIVE_DATA_COLUMNS and value is not None:
+                            row_dict[col_name] = '***'
+                        else:
+                            row_dict[col_name] = value
                     data.append(row_dict)
 
                 return data, columns
 
+            except ValueError as e:
+                logger.warning(f"拒绝非法表数据查询: {table_name} - {e}")
+                raise
             except Exception as e:
                 logger.error(f"获取表数据失败: {table_name} - {e}")
                 return [], []
@@ -4767,6 +4960,7 @@ class DBManager:
         """删除指定表的指定记录"""
         with self.lock:
             try:
+                table_name = self._validate_table_name(table_name)
                 cursor = self.conn.cursor()
 
                 # 根据表名确定主键字段
@@ -4815,6 +5009,7 @@ class DBManager:
         """清空指定表的所有数据"""
         with self.lock:
             try:
+                table_name = self._validate_table_name(table_name)
                 cursor = self.conn.cursor()
 
                 # 清空表数据

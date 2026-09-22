@@ -107,7 +107,7 @@ class XianyuSearcher:
                     logger.warning("⚠️ 无法获取外网IP，使用 localhost")
                     logger.warning("💡 如果在Docker中，请设置环境变量 SERVER_HOST 为公网IP")
                 
-                control_url = f"http://{local_ip}:8000/api/captcha/control/{session_id}"
+                control_url = f"http://{local_ip}:8000/api/captcha/control/{session_id}?token={session_info.get('access_token', '')}"
                 
                 logger.warning("=" * 60)
                 logger.warning(f"🌐 远程控制已启动！")
@@ -115,7 +115,7 @@ class XianyuSearcher:
                 logger.warning(f"   {control_url}")
                 logger.warning("=" * 60)
                 logger.warning(f"💡 或直接访问: http://{local_ip}:8000/api/captcha/control")
-                logger.warning(f"   然后输入会话ID: {session_id}")
+                logger.warning(f"   然后输入会话ID: {session_id}（以及控制页面URL中的 token）")
                 logger.warning("=" * 60)
                 
                 # 如果不等待完成，立即返回特殊值给调用者
