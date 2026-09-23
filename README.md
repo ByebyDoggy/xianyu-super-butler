@@ -178,6 +178,7 @@ docker compose --profile auto-update up -d
 
 - 未启用 Watchtower 时，页面上的「在线更新」会回退为容器内临时更新，并在界面明确提示“重建容器后会回退”。
 - 启用了 Watchtower 后，按钮会调用其 HTTP API 拉取最新镜像并重建容器；`data/`、`logs/` 等数据卷不受影响。
+- Watchtower 同时开启定时轮询（`WATCHTOWER_HTTP_API_PERIODIC_POLLS=true`，默认每 `WATCHTOWER_POLL_INTERVAL=300` 秒检查一次），即使不点按钮也会自动升级到最新镜像。
 - Watchtower 需要挂载 `/var/run/docker.sock`（可控制宿主机 Docker），仅建议在可信环境启用，并修改 `WATCHTOWER_TOKEN`。
 
 > 使用宿主机挂载目录时，请确保容器内 uid 1000 可写：`chown -R 1000:1000 data logs`
