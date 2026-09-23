@@ -279,3 +279,103 @@ def test_update_safe_extract_rejects_traversal_and_links(tmp_path):
     with tarfile.open(fileobj=buf, mode="r:gz") as tar:
         with pytest.raises(updater.UpdateError):
             updater._safe_extract_tar(tar, tmp_path / "out2")
+
+
+# ---------------------------------------------------------------------------
+# Docker 在线更新（Watchtower / 持久化）安全与行为测试
+# ---------------------------------------------------------------------------
+
+class _FakeUpdateDB:
+    def __init__(self, **kw):
+        self._kw = kw
+
+    def get_system_setting(self, key):
+        return self._kw.get(key)
+
+
+def test_docker_detection(monkeypatch):
+    from utils import updater
+    monkeypatch.delenv("DOCKER_ENV", raising=False)
+    monkeypatch.setattr(updater.Path, "exists", lambda self: False)
+    assert updater.is_docker() is False
+    monkeypatch.setenv("DOCKER_ENV", "true")
+    assert updater.is_docker() is True
+
+
+def test_local_commit_falls_back_to_app_commit(monkeypatch):
+    from utils import updater
+    monkeypatch.setattr(updater, "_is_git_repo", lambda: False)
+    monkeypatch.setenv("APP_COMMIT", "deadbeef")
+    assert updater.get_local_commit() == "deadbeef"
+    monkeypatch.delenv("APP_COMMIT", raising=False)
+    assert updater.get_local_commit() is None
+
+
+def test_apply_update_uses_watchtower_in_docker(monkeypatch):
+    from utils import updater
+
+    called = {}
+
+    class _Resp:
+        status_code = 200
+
+    def _fake_post(url, headers=None, timeout=None):
+        called["url"] = url
+        return _Resp()
+
+    monkeypatch.setattr(updater, "is_docker", lambda: True)
+    monkeypatch.setattr(updater, "get_watchtower_config",
+                        lambda: {"url": "http://watchtower:8080", "token": "t"})
+    monkeypatch.setattr(updater.requests, "post", _fake_post)
+    # 确保不会走容器内覆盖
+    monkeypatch.setattr(updater, "_apply_tarball_update",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("should not tarball")))
+
+    result = updater.apply_update(_FakeUpdateDB(), force=False)
+    assert result["success"] is True
+    assert result["method"] == "watchtower"
+    assert result["persistent"] is True
+    assert result["restart_required"] is False
+    assert called["url"].endswith("/v1/update")
+
+
+def test_apply_update_docker_without_watchtower_marks_not_persistent(monkeypatch):
+    from utils import updater
+
+    monkeypatch.setattr(updater, "is_docker", lambda: True)
+    monkeypatch.setattr(updater, "get_watchtower_config", lambda: {"url": "", "token": ""})
+    monkeypatch.setattr(updater, "_is_git_repo", lambda: False)
+    monkeypatch.setattr(updater, "_apply_tarball_update", lambda *a, **k: "stub")
+
+    result = updater.apply_update(_FakeUpdateDB(), force=False)
+    assert result["method"] == "tarball"
+    assert result["persistent"] is False
+    assert "warning" in result and "Watchtower" in result["warning"]
+
+
+def test_trigger_watchtower_http_error(monkeypatch):
+    from utils import updater
+
+    class _Resp:
+        status_code = 500
+
+    monkeypatch.setattr(updater, "get_watchtower_config",
+                        lambda: {"url": "http://watchtower:8080", "token": ""})
+    monkeypatch.setattr(updater.requests, "post", lambda *a, **k: _Resp())
+    with pytest.raises(updater.UpdateError):
+        updater.trigger_watchtower()
+
+
+def test_trigger_watchtower_unreachable_returns_none(monkeypatch):
+    """Watchtower 未运行时不应报错，而是回退到容器内更新"""
+    from utils import updater
+    import requests as _requests
+
+    monkeypatch.setattr(updater, "get_watchtower_config",
+                        lambda: {"url": "http://watchtower:8080", "token": ""})
+
+    def _boom(*a, **k):
+        raise _requests.ConnectionError("refused")
+
+    monkeypatch.setattr(updater.requests, "post", _boom)
+    assert updater.trigger_watchtower() is None

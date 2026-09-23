@@ -258,6 +258,15 @@ test_admin_data_table_sql_injection_rejected
 - **鉴权**：接口仅管理员可用；Token 不写日志（并命中 SQL 日志脱敏规则）；
 - **可回滚**：Git 部署下为快进合并，保留完整提交历史，可随时 `git reset` 回退。
 
+#### Docker 下的持久化更新（重要）
+
+容器内程序文件位于可写层，容器重建/镜像重拉后会回退，因此 Docker 下采用“镜像级更新”：
+
+- 镜像构建时通过 `--build-arg GIT_SHA` 注入提交号（`ENV APP_COMMIT`），使容器内无需 `.git` 也能比对版本；
+- `docker-compose` 默认使用 GHCR 镜像并 `pull_policy: always`；启用 `auto-update` profile 后由 Watchtower 负责拉镜像+重建容器；
+- `apply_update` 检测到容器环境且配置了 `WATCHTOWER_URL` 时，仅调用其 HTTP API 触发镜像更新（`persistent=True`）；Watchtower 不可达时回退为容器内更新并在接口/界面返回 `persistent=False` 与明确警告；
+- Watchtower HTTP API 通过 `WATCHTOWER_TOKEN` 鉴权，仅在 compose 内网暴露；挂载 `docker.sock` 属高权限操作，作为可选 profile 提供。
+
 > 注意：在线更新会用仓库中的代码覆盖程序文件，这本质上是一次受信任的代码分发，
 > 请确保该仓库由你可控；建议在更新前通过「检查更新」确认提交来源。
 
@@ -266,4 +275,8 @@ test_admin_data_table_sql_injection_rejected
 `tests/security/test_security_regressions.py` 新增：
 `test_system_settings_requires_admin`、`test_update_endpoints_require_admin`、
 `test_update_repo_validation`、`test_update_protected_paths`、
-`test_check_update_rejects_bad_repo_without_network`。
+`test_check_update_rejects_bad_repo_without_network`、
+`test_docker_detection`、`test_local_commit_falls_back_to_app_commit`、
+`test_apply_update_uses_watchtower_in_docker`、
+`test_apply_update_docker_without_watchtower_marks_not_persistent`、
+`test_trigger_watchtower_http_error`、`test_trigger_watchtower_unreachable_returns_none`。

@@ -23,6 +23,7 @@ const Settings: React.FC = () => {
   const [applyingUpdate, setApplyingUpdate] = useState(false);
   const [updateError, setUpdateError] = useState('');
   const [restartAfterUpdate, setRestartAfterUpdate] = useState(true);
+  const [updateNotice, setUpdateNotice] = useState('');
 
   useEffect(() => {
     loadSettings();
@@ -63,9 +64,12 @@ const Settings: React.FC = () => {
     if (!window.confirm('确定要立即在线更新吗？更新完成后服务可能需要重启。')) return;
     setApplyingUpdate(true);
     setUpdateError('');
+    setUpdateNotice('');
     try {
       const res = await applySystemUpdate({ restart: restartAfterUpdate, force: false });
-      alert('更新完成：' + (res.detail || '') + (res.restart_scheduled ? '，服务正在重启...' : '，请手动重启服务'));
+      const msg = res.detail || '';
+      setUpdateNotice(res.warning ? `${msg}\n${res.warning}` : msg);
+      alert('更新完成：' + msg + (res.restart_scheduled ? '，服务正在重启...' : res.restart_required === false ? '' : '，请手动重启服务'));
     } catch (e) {
       setUpdateError((e as Error).message);
     } finally {
@@ -484,7 +488,7 @@ const Settings: React.FC = () => {
                   <><CheckCircle2 className="w-4 h-4 text-emerald-500" /> 已是最新版本</>
                 )}
                 {updateInfo.update_available == null && (
-                  <><GitBranch className="w-4 h-4 text-gray-400" /> 非 Git 部署，无法比对提交号</>
+                  <><GitBranch className="w-4 h-4 text-gray-400" /> 当前部署方式无法自动比对提交号</>
                 )}
               </div>
               <div className="text-gray-600">当前版本：{updateInfo.current_version}
@@ -501,6 +505,24 @@ const Settings: React.FC = () => {
                   查看提交详情
                 </a>
               )}
+              {updateInfo.deployment === 'docker' && updateInfo.watchtower_enabled && (
+                <div className="p-3 bg-emerald-50 rounded-xl text-xs text-emerald-700">
+                  已启用 Watchtower：更新将拉取最新镜像并重建容器，可持久化（数据卷不受影响）。
+                </div>
+              )}
+              {updateInfo.deployment === 'docker' && !updateInfo.watchtower_enabled && (
+                <div className="p-3 bg-amber-50 rounded-xl text-xs text-amber-700">
+                  Docker 部署且未启用 Watchtower：容器内更新会在容器重建/镜像重拉后回退。
+                  建议启动镜像自动更新：<code className="bg-white/60 px-1 rounded">docker compose --profile auto-update up -d</code>，
+                  或手动执行 <code className="bg-white/60 px-1 rounded">docker compose pull && docker compose up -d</code>。
+                </div>
+              )}
+            </div>
+          )}
+
+          {updateNotice && (
+            <div className="p-3 bg-blue-50 rounded-xl text-sm text-blue-700 whitespace-pre-line">
+              {updateNotice}
             </div>
           )}
         </div>

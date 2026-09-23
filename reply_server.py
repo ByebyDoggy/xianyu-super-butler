@@ -3146,7 +3146,7 @@ def apply_system_update(req: UpdateApplyRequest, admin_user: Dict[str, Any] = De
             admin_user,
         )
         result['restart_scheduled'] = False
-        if req.restart:
+        if req.restart and result.get('restart_required', True):
             result['restart_scheduled'] = schedule_restart()
         return result
     except UpdateError as e:

@@ -354,6 +354,9 @@ export interface UpdateCheckResult {
   behind_by?: number | null;
   update_available?: boolean | null;
   can_git_update?: boolean;
+  deployment?: 'docker' | 'git' | 'source';
+  watchtower_enabled?: boolean;
+  persistent_update?: boolean;
 }
 
 export const checkSystemUpdate = async (): Promise<UpdateCheckResult> => {
