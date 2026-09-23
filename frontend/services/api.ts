@@ -337,6 +337,36 @@ export const updateSystemSettings = async (settings: Partial<SystemSettings>): P
     return { success: true, message: 'Settings saved' };
 };
 
+// System Update
+export interface UpdateCheckResult {
+  success: boolean;
+  repo: string;
+  branch: string;
+  current_version: string;
+  current_commit?: string | null;
+  latest_commit?: string;
+  latest_message?: string;
+  latest_author?: string;
+  latest_date?: string;
+  html_url?: string;
+  compare_status?: string | null;
+  ahead_by?: number | null;
+  behind_by?: number | null;
+  update_available?: boolean | null;
+  can_git_update?: boolean;
+}
+
+export const checkSystemUpdate = async (): Promise<UpdateCheckResult> => {
+  return get<UpdateCheckResult>('/system/update/check');
+};
+
+export const applySystemUpdate = async (opts: { restart?: boolean; force?: boolean } = {}): Promise<any> => {
+  return post('/system/update/apply', {
+    restart: Boolean(opts.restart),
+    force: Boolean(opts.force),
+  });
+};
+
 export const getAccountAISettings = async (cookieId: string): Promise<AIReplySettings> => {
     return get(`/ai-reply-settings/${cookieId}`);
 }

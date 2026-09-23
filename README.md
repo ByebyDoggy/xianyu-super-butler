@@ -136,6 +136,36 @@ npm run dev
 
 ---
 
+## 🐳 Docker 部署
+
+镜像通过 GitHub Actions 自动构建并发布到 GHCR（见 `.github/workflows/docker-publish.yml`）：
+
+```bash
+# 镜像地址（推送 main / tag 时自动发布）
+ghcr.io/byebydoggy/xianyu-super-butler:latest
+
+# 启动（数据持久化到 ./data、./logs）
+docker run -d --name xianyu-butler \
+  -p 8080:8080 \
+  -v "$PWD/data:/app/data" \
+  -v "$PWD/logs:/app/logs" \
+  --restart unless-stopped \
+  ghcr.io/byebydoggy/xianyu-super-butler:latest
+
+# 初始化管理员账号（首次部署）
+docker exec -it xianyu-butler python /app/init_admin.py
+```
+
+或使用仓库自带的 compose（本地构建）：
+
+```bash
+docker compose up -d --build
+```
+
+> 使用宿主机挂载目录时，请确保容器内 uid 1000 可写：`chown -R 1000:1000 data logs`
+
+---
+
 ## 🏗️ 技术栈
 
 **后端：** FastAPI · Python 3.11+ · SQLite · Playwright · WebSocket · Asyncio

@@ -6,6 +6,7 @@
 import asyncio
 import base64
 import json
+import secrets
 from typing import Optional, Dict, Any
 from loguru import logger
 from playwright.async_api import Page
@@ -46,22 +47,32 @@ class CaptchaRemoteController:
             viewport = {'width': 1280, 'height': 720}  # 默认值
         
         # 存储会话
+        access_token = secrets.token_urlsafe(32)
         self.active_sessions[session_id] = {
             'page': page,
             'screenshot': screenshot_base64,
             'captcha_info': captcha_info,
             'completed': False,
-            'viewport': viewport
+            'viewport': viewport,
+            'access_token': access_token,
         }
         
         logger.info(f"✅ 创建远程控制会话: {session_id}")
         
         return {
             'session_id': session_id,
+            'access_token': access_token,
             'screenshot': screenshot_base64,
             'captcha_info': captcha_info,
             'viewport': self.active_sessions[session_id]['viewport']
         }
+
+    def get_access_token(self, session_id: str) -> Optional[str]:
+        """获取会话的访问令牌（用于校验远程控制页面/WebSocket）"""
+        session = self.active_sessions.get(session_id)
+        if not session:
+            return None
+        return session.get('access_token')
     
     async def _screenshot_captcha_area(self, page: Page, captcha_info: Dict[str, Any]) -> bytes:
         """截取整个验证码容器区域"""

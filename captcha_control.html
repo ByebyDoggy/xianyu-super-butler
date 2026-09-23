@@ -382,8 +382,11 @@
             log(`正在连接会话: ${sessionId}`, 'info');
 
             try {
-                // 建立 WebSocket 连接
-                const wsUrl = `ws://${window.location.host}/api/captcha/ws/${sessionId}`;
+                // 建立 WebSocket 连接（携带会话访问令牌，避免未授权访问）
+                const sessionToken = window.INITIAL_SESSION_TOKEN || new URLSearchParams(window.location.search).get('token') || '';
+                const wsScheme = window.location.protocol === 'https:' ? 'wss' : 'ws';
+                const tokenQuery = sessionToken ? `?token=${encodeURIComponent(sessionToken)}` : '';
+                const wsUrl = `${wsScheme}://${window.location.host}/api/captcha/ws/${encodeURIComponent(sessionId)}${tokenQuery}`;
                 log(`WebSocket URL: ${wsUrl}`, 'info');
                 
                 ws = new WebSocket(wsUrl);

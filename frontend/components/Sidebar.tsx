@@ -5,9 +5,10 @@ interface SidebarProps {
   activeTab: string;
   setActiveTab: (tab: string) => void;
   onLogout: () => void;
+  isAdmin?: boolean;
 }
 
-const Sidebar: React.FC<SidebarProps> = ({ activeTab, setActiveTab, onLogout }) => {
+const Sidebar: React.FC<SidebarProps> = ({ activeTab, setActiveTab, onLogout, isAdmin = false }) => {
   const menuItems = [
     { id: 'dashboard', icon: LayoutDashboard, label: '仪表盘' },
     { id: 'accounts', icon: Users, label: '账号管理' },
@@ -15,7 +16,7 @@ const Sidebar: React.FC<SidebarProps> = ({ activeTab, setActiveTab, onLogout }) 
     { id: 'cards', icon: CreditCard, label: '卡密库存' },
     { id: 'items', icon: Box, label: '商品列表' },
     { id: 'keywords', icon: MessageSquare, label: '关键词管理' },
-    { id: 'settings', icon: Settings, label: '系统与AI' },
+    ...(isAdmin ? [{ id: 'settings', icon: Settings, label: '系统与AI' }] : []),
   ];
 
   return (
