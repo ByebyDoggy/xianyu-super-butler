@@ -63,8 +63,10 @@ COPY --from=builder /app /app
 ENV VIRTUAL_ENV=/opt/venv
 ENV PATH="$VIRTUAL_ENV/bin:$PATH"
 
+# 安装 playwright 与 patchright 各自绑定的 Chromium（revision 不同，缺一会导致滑块失败）
 RUN playwright install-deps chromium && \
     playwright install chromium && \
+    patchright install chromium && \
     mkdir -p /app/logs /app/data /app/backups /app/static/uploads/images && \
     chmod 777 /app/logs /app/data /app/backups /app/static/uploads /app/static/uploads/images && \
     chmod +x /app/entrypoint.sh

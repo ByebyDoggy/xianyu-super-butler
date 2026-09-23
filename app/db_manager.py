@@ -2,6 +2,8 @@ import sqlite3
 import os
 import threading
 import hashlib
+import hmac
+import secrets
 import time
 import json
 import random
@@ -17,8 +19,57 @@ from app.specification import (
     specification_text,
 )
 
+PBKDF2_PREFIX = "pbkdf2_sha256"
+PBKDF2_ITERATIONS = 600_000
+
+
+def _hash_password(password: str) -> str:
+    """Generate PBKDF2-HMAC-SHA256 password hash with a random salt."""
+    salt = secrets.token_bytes(16)
+    dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, PBKDF2_ITERATIONS)
+    return f"{PBKDF2_PREFIX}${PBKDF2_ITERATIONS}${salt.hex()}${dk.hex()}"
+
+
+def _verify_password_hash(password: str, stored_hash: str) -> bool:
+    """Verify password; also accept legacy unsalted SHA-256 hashes."""
+    if not stored_hash:
+        return False
+    if stored_hash.startswith(PBKDF2_PREFIX + "$"):
+        try:
+            _, iterations, salt_hex, hash_hex = stored_hash.split("$", 3)
+            dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), bytes.fromhex(salt_hex), int(iterations))
+            return hmac.compare_digest(dk.hex(), hash_hex)
+        except (ValueError, TypeError):
+            return False
+    if len(stored_hash) == 64:
+        return hmac.compare_digest(hashlib.sha256(password.encode("utf-8")).hexdigest(), stored_hash)
+    return False
+
+
+def _needs_rehash(stored_hash: str) -> bool:
+    return not (stored_hash or "").startswith(PBKDF2_PREFIX + "$")
+
+
 class DBManager:
     """SQLite数据库管理，持久化存储Cookie和关键字"""
+
+    _SYSTEM_IMPORT_TABLES = {
+        'cookies', 'keywords', 'cookie_status', 'cards', 'delivery_rules',
+        'default_replies', 'notification_channels', 'message_notifications',
+        'system_settings', 'item_info', 'ai_reply_settings', 'ai_conversations',
+        'ai_item_cache',
+    }
+    _USER_IMPORT_TABLES = _SYSTEM_IMPORT_TABLES - {'system_settings', 'notification_channels'}
+
+    @staticmethod
+    def _table_exists(cursor, table_name: str) -> bool:
+        cursor.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table_name,))
+        return cursor.fetchone() is not None
+
+    @staticmethod
+    def _table_columns(cursor, table_name: str) -> list:
+        cursor.execute(f"PRAGMA table_info({table_name})")
+        return [row[1] for row in cursor.fetchall()]
     
     def __init__(self, db_path: str = None):
         """初始化数据库连接和表结构"""
@@ -996,7 +1047,7 @@ class DBManager:
                 # 此前这里写死 admin123，而 docker-compose 又强制要求填 ADMIN_PASSWORD，
                 # 结果是部署方以为自己设了强密码，实际登录的还是默认密码。
                 initial_password = (os.getenv('ADMIN_PASSWORD') or '').strip() or 'admin123'
-                default_password_hash = hashlib.sha256(initial_password.encode()).hexdigest()
+                default_password_hash = _hash_password(initial_password)
                 cursor.execute('''
                 INSERT INTO users (username, email, password_hash) VALUES
                 ('admin', 'admin@localhost', ?)
@@ -3396,40 +3447,76 @@ class DBManager:
                     self._execute_sql(cursor, "DELETE FROM system_settings WHERE key != 'admin_password_hash'")
 
                 # 导入数据
+                # 安全加固：表名白名单 + 列名必须真实存在 + 行宽校验，防止列名拼接 SQL 注入
                 data = backup_data['data']
+                if not isinstance(data, dict):
+                    raise ValueError("备份数据格式无效")
+
+                allowed_tables = (self._USER_IMPORT_TABLES if user_id is not None
+                                  else self._SYSTEM_IMPORT_TABLES)
+
+                owned_cookie_ids = set()
+                if user_id is not None:
+                    cookies_data = data.get('cookies')
+                    if isinstance(cookies_data, dict) and 'id' in (cookies_data.get('columns') or []):
+                        idx = cookies_data['columns'].index('id')
+                        for r in cookies_data.get('rows') or []:
+                            if isinstance(r, (list, tuple)) and len(r) > idx:
+                                owned_cookie_ids.add(r[idx])
+
                 for table_name, table_data in data.items():
-                    if table_name not in ['cookies', 'keywords', 'cookie_status', 'cards',
-                                        'delivery_rules', 'default_replies', 'notification_channels',
-                                        'message_notifications', 'system_settings', 'item_info',
-                                        'ai_reply_settings', 'ai_conversations', 'ai_item_cache']:
+                    if not isinstance(table_name, str) or table_name not in allowed_tables:
+                        logger.warning(f"备份导入：跳过不允许的表 {table_name}")
+                        continue
+                    if not self._table_exists(cursor, table_name):
+                        raise ValueError(f"表不存在: {table_name}")
+                    if not isinstance(table_data, dict):
+                        raise ValueError(f"表 {table_name} 的备份数据格式无效")
+
+                    columns = table_data.get('columns')
+                    rows = table_data.get('rows')
+                    if not isinstance(columns, list) or not columns:
+                        continue
+                    if not all(isinstance(c, str) for c in columns) or len(set(columns)) != len(columns):
+                        raise ValueError(f"表 {table_name} 的列名无效")
+
+                    table_columns = self._table_columns(cursor, table_name)
+                    unknown = [c for c in columns if c not in table_columns]
+                    if unknown:
+                        raise ValueError(f"表 {table_name} 存在非法列名: {unknown}")
+
+                    if not isinstance(rows, list) or not rows:
                         continue
 
-                    columns = table_data['columns']
-                    rows = table_data['rows']
+                    col_index = {name: i for i, name in enumerate(columns)}
+                    if user_id is not None:
+                        if 'user_id' in col_index:
+                            i = col_index['user_id']
+                            rows = [[user_id if j == i else v for j, v in enumerate(r)] for r in rows]
+                        elif 'user_id' in table_columns:
+                            columns = columns + ['user_id']
+                            col_index['user_id'] = len(columns) - 1
+                            rows = [list(r) + [user_id] for r in rows]
 
-                    if not rows:
-                        continue
+                    cookie_idx = col_index.get('cookie_id')
+                    normalized_rows = []
+                    for r in rows:
+                        if isinstance(r, tuple):
+                            r = list(r)
+                        if not isinstance(r, list) or len(r) != len(columns):
+                            raise ValueError(f"表 {table_name} 的行数据宽度与列数不一致")
+                        if cookie_idx is not None and r[cookie_idx] not in owned_cookie_ids:
+                            raise ValueError(f"表 {table_name} 引用了不属于当前账号的 cookie_id")
+                        normalized_rows.append(r)
 
-                    # 如果是用户级导入，需要确保cookies表的user_id正确
-                    if user_id is not None and table_name == 'cookies':
-                        # 更新所有导入的cookies的user_id
-                        updated_rows = []
-                        for row in rows:
-                            row_dict = dict(zip(columns, row))
-                            row_dict['user_id'] = user_id
-                            updated_rows.append([row_dict[col] for col in columns])
-                        rows = updated_rows
-
-                    # 构建插入语句
                     placeholders = ','.join(['?' for _ in columns])
-
+                    column_sql = ','.join(columns)
                     if table_name == 'system_settings':
-                        # 系统设置需要特殊处理，避免覆盖管理员密码
-                        for row in rows:
+                        for row in normalized_rows:
                             if len(row) >= 1 and row[0] != 'admin_password_hash':
-                                cursor.execute(f"INSERT INTO {table_name} ({','.join(columns)}) VALUES ({placeholders})", row)
+                                cursor.execute(f"INSERT INTO {table_name} ({column_sql}) VALUES ({placeholders})", row)
                     else:
-                        cursor.executemany(f"INSERT INTO {table_name} ({','.join(columns)}) VALUES ({placeholders})", rows)
+                        cursor.executemany(f"INSERT INTO {table_name} ({column_sql}) VALUES ({placeholders})", normalized_rows)
 
                 # 提交事务
                 self.conn.commit()
@@ -3496,7 +3583,7 @@ class DBManager:
         with self.lock:
             try:
                 cursor = self.conn.cursor()
-                password_hash = hashlib.sha256(password.encode()).hexdigest()
+                password_hash = _hash_password(password)
 
                 cursor.execute('''
                 INSERT INTO users (username, email, password_hash)
@@ -3573,15 +3660,27 @@ class DBManager:
         if not user:
             return False
 
-        password_hash = hashlib.sha256(password.encode()).hexdigest()
-        return user['password_hash'] == password_hash and user['is_active']
+        if not _verify_password_hash(password, user['password_hash']):
+            return False
+        if not user.get('is_active'):
+            return False
+        if _needs_rehash(user['password_hash']):
+            try:
+                with self.lock:
+                    cursor = self.conn.cursor()
+                    cursor.execute("UPDATE users SET password_hash = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                                   (_hash_password(password), user['id']))
+                    self.conn.commit()
+            except Exception as e:
+                logger.warning(f"upgrade password hash failed: {e}")
+        return True
 
     def update_user_password(self, username: str, new_password: str) -> bool:
         """更新用户密码"""
         with self.lock:
             try:
                 cursor = self.conn.cursor()
-                password_hash = hashlib.sha256(new_password.encode()).hexdigest()
+                password_hash = _hash_password(new_password)
 
                 cursor.execute('''
                 UPDATE users SET password_hash = ?, updated_at = CURRENT_TIMESTAMP
