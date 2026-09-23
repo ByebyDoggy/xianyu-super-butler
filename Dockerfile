@@ -56,6 +56,10 @@ COPY --from=frontend-builder /static ./static
 # Runtime stage: only keep what is needed to run the app
 FROM base AS runtime
 
+# 镜像构建时注入的提交号，供容器内的“检查更新”比对（COPY . . 已排除 .git）
+ARG GIT_SHA=unknown
+ENV APP_COMMIT=$GIT_SHA
+
 # 设置标签信息
 LABEL maintainer="zhinianboke" \
       version="2.2.0" \

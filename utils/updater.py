@@ -59,6 +59,54 @@ def get_local_version() -> str:
     return "unknown"
 
 
+def is_docker() -> bool:
+    """判断是否运行在容器中"""
+    if os.getenv("DOCKER_ENV", "").strip().lower() in ("1", "true", "yes"):
+        return True
+    try:
+        return Path("/.dockerenv").exists()
+    except Exception:
+        return False
+
+
+def get_local_commit() -> Optional[str]:
+    """获取当前部署的提交号：优先 git，其次镜像构建时注入的 APP_COMMIT"""
+    if _is_git_repo():
+        commit = _git_output(["rev-parse", "HEAD"])
+        if commit:
+            return commit
+    commit = (os.getenv("APP_COMMIT") or "").strip()
+    return commit or None
+
+
+def get_watchtower_config() -> Dict[str, str]:
+    """读取 Watchtower HTTP API 配置（用于 Docker 镜像级更新）"""
+    return {
+        "url": (os.getenv("WATCHTOWER_URL") or "").strip().rstrip("/"),
+        "token": (os.getenv("WATCHTOWER_TOKEN") or "").strip(),
+    }
+
+
+def trigger_watchtower() -> Optional[Dict[str, Any]]:
+    """触发 Watchtower 拉取最新镜像并重建容器；未配置时返回 None"""
+    cfg = get_watchtower_config()
+    if not cfg["url"]:
+        return None
+    headers = {"Content-Type": "application/json"}
+    if cfg["token"]:
+        headers["Authorization"] = f"Bearer {cfg['token']}"
+    try:
+        resp = requests.post(f"{cfg['url']}/v1/update", headers=headers, timeout=30)
+    except requests.RequestException:
+        # Watchtower 未运行/不可达：返回 None，由调用方回退到容器内更新
+        logger.warning("Watchtower 不可达，回退为容器内更新")
+        return None
+    if resp.status_code >= 400:
+        raise UpdateError(f"Watchtower 返回错误: HTTP {resp.status_code}")
+    logger.info("已触发 Watchtower 镜像更新")
+    return {"triggered": True, "url": cfg["url"]}
+
+
 def get_update_config(db_manager) -> Dict[str, str]:
     """从系统设置读取（并经校验的）更新配置"""
     repo = (db_manager.get_system_setting("github_repo") or DEFAULT_REPO).strip()
@@ -146,7 +194,7 @@ def check_update(db_manager) -> Dict[str, Any]:
     cfg = get_update_config(db_manager)
     repo, branch, token = cfg["repo"], cfg["branch"], cfg["token"]
 
-    local_commit = _git_output(["rev-parse", "HEAD"]) if _is_git_repo() else None
+    local_commit = get_local_commit()
 
     data = _get_json(f"{GITHUB_API}/repos/{repo}/commits/{branch}", token=token)
     latest_commit = data.get("sha") or ""
@@ -196,6 +244,9 @@ def check_update(db_manager) -> Dict[str, Any]:
         "html_url": data.get("html_url") or f"https://github.com/{repo}/commit/{latest_commit}",
         "update_available": update_available,
         "can_git_update": _is_git_repo(),
+        "deployment": "docker" if is_docker() else ("git" if _is_git_repo() else "source"),
+        "watchtower_enabled": bool(get_watchtower_config()["url"]),
+        "persistent_update": (not is_docker()) or bool(get_watchtower_config()["url"]),
     }
 
 
@@ -310,25 +361,58 @@ def _apply_tarball_update(repo: str, branch: str, token: str) -> str:
 
 
 def apply_update(db_manager, force: bool = False) -> Dict[str, Any]:
-    """执行在线更新。"""
+    """执行在线更新。
+
+    - Docker 且配置了 Watchtower：触发镜像级更新（可持久化，容器重建后仍为新版本）；
+    - 其它 Docker 环境：回退为容器内源码覆盖（仅当前容器有效，重建后会回退）；
+    - 非 Docker：git 快进合并或源码包覆盖。
+    """
     cfg = get_update_config(db_manager)
     repo, branch, token = cfg["repo"], cfg["branch"], cfg["token"]
+    docker = is_docker()
+
+    # Docker 优先走 Watchtower（镜像级、可持久化）
+    if docker:
+        wt = trigger_watchtower()
+        if wt:
+            return {
+                "success": True,
+                "method": "watchtower",
+                "repo": repo,
+                "branch": branch,
+                "detail": "已触发 Watchtower 拉取最新镜像并重建容器（数据卷保持不变）",
+                "persistent": True,
+                "restart_required": False,
+            }
 
     if _is_git_repo():
         detail = _apply_git_update(branch, force=force)
         method = "git"
+        persistent = True
     else:
         detail = _apply_tarball_update(repo, branch, token)
         method = "tarball"
+        persistent = not docker
 
-    return {
+    result: Dict[str, Any] = {
         "success": True,
         "method": method,
         "repo": repo,
         "branch": branch,
         "detail": detail,
+        "persistent": persistent,
         "restart_required": True,
     }
+
+    if docker and not persistent:
+        result["warning"] = (
+            "当前为 Docker 部署且未启用 Watchtower：本次更新仅写入容器可写层，"
+            "容器被重建或镜像重新拉取后会回退到镜像版本。"
+            "建议启用 Watchtower（docker compose --profile auto-update up -d）"
+            "或使用 docker compose pull && docker compose up -d。"
+        )
+
+    return result
 
 
 def schedule_restart(delay: float = 2.0) -> bool:

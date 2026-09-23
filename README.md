@@ -156,11 +156,29 @@ docker run -d --name xianyu-butler \
 docker exec -it xianyu-butler python /app/init_admin.py
 ```
 
-或使用仓库自带的 compose（本地构建）：
+或使用仓库自带的 compose（默认拉取上面的 GHCR 镜像）：
 
 ```bash
-docker compose up -d --build
+docker compose up -d
+# 需本地构建时：取消 docker-compose.yml 中 build: 的注释并注释 image:
 ```
+
+### 关于「在线更新」在 Docker 下的行为
+
+容器内的程序文件位于容器可写层，**容器被重建或镜像重新拉取后会回退到镜像版本**，因此 Docker 下推荐“镜像级更新”：
+
+```bash
+# 方式一：手动拉取最新镜像并重建
+docker compose pull && docker compose up -d
+
+# 方式二（推荐）：启用 Watchtower，自动拉取新镜像并重建
+#   启用后，系统设置里的「在线更新」按钮会触发 Watchtower 立即更新（可持久化）
+docker compose --profile auto-update up -d
+```
+
+- 未启用 Watchtower 时，页面上的「在线更新」会回退为容器内临时更新，并在界面明确提示“重建容器后会回退”。
+- 启用了 Watchtower 后，按钮会调用其 HTTP API 拉取最新镜像并重建容器；`data/`、`logs/` 等数据卷不受影响。
+- Watchtower 需要挂载 `/var/run/docker.sock`（可控制宿主机 Docker），仅建议在可信环境启用，并修改 `WATCHTOWER_TOKEN`。
 
 > 使用宿主机挂载目录时，请确保容器内 uid 1000 可写：`chown -R 1000:1000 data logs`
 

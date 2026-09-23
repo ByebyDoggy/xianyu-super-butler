@@ -1,11 +1,15 @@
 services:
   xianyu-app:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    image: xianyu-auto-reply:latest
+    # 默认使用 CI 自动发布到 GHCR 的镜像；本地构建见下方注释
+    image: ghcr.io/byebydoggy/xianyu-super-butler:latest
+    # build:
+    #   context: .
+    #   dockerfile: Dockerfile
+    pull_policy: always
     container_name: xianyu-auto-reply
     restart: unless-stopped
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
     ports:
       - "${WEB_PORT:-8080}:8080"
     volumes:
@@ -32,6 +36,9 @@ services:
       # 安全：会话 Cookie 的 Secure 标记（HTTPS 部署时请设为 true）
       - SESSION_COOKIE_SECURE=${SESSION_COOKIE_SECURE:-false}
       - SESSION_TIMEOUT=${SESSION_TIMEOUT:-3600}
+      # 在线更新：Docker 下通过 Watchtower 实现镜像级更新（可持久化）；未启用则为容器内临时更新
+      - WATCHTOWER_URL=${WATCHTOWER_URL:-http://watchtower:8080}
+      - WATCHTOWER_TOKEN=${WATCHTOWER_TOKEN:-xianyu-watchtower-token}
       # 多用户系统配置
       - MULTIUSER_ENABLED=${MULTIUSER_ENABLED:-true}
       - USER_REGISTRATION_ENABLED=${USER_REGISTRATION_ENABLED:-true}
@@ -73,6 +80,26 @@ services:
         reservations:
           memory: ${MEMORY_RESERVATION:-512}M
           cpus: '${CPU_RESERVATION:-0.5}'
+
+  # 可选：自动拉取最新镜像并重建容器（启动：docker compose --profile auto-update up -d）
+  watchtower:
+    image: containrrr/watchtower:latest
+    container_name: xianyu-watchtower
+    restart: unless-stopped
+    volumes:
+      # 注意：挂载 docker.sock 后 Watchtower 可控制宿主机 Docker，仅建议在可信环境启用
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      - TZ=${TZ:-Asia/Shanghai}
+      - WATCHTOWER_LABEL_ENABLE=true
+      - WATCHTOWER_CLEANUP=true
+      - WATCHTOWER_HTTP_API_UPDATE=true
+      - WATCHTOWER_HTTP_API_TOKEN=${WATCHTOWER_TOKEN:-xianyu-watchtower-token}
+      - WATCHTOWER_POLL_INTERVAL=${WATCHTOWER_POLL_INTERVAL:-300}
+    networks:
+      - xianyu-network
+    profiles:
+      - auto-update
 
   # 可选：添加Nginx反向代理
   nginx:
