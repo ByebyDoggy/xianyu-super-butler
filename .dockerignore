@@ -362,3 +362,8 @@ ENV/
 # order_status_handler.py - 保留，是核心订单处理模块
 php/
 # simple_stats_server.py - 保留，是可选的统计服务器
+# 本地安全测试/虚拟环境（避免进入构建上下文）
+.venv-test/
+.venv-sec/
+sec_tmp/
+.pytest_cache/

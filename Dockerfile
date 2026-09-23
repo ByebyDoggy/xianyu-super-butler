@@ -20,7 +20,7 @@ WORKDIR /frontend
 COPY frontend/package.json frontend/pnpm-lock.yaml ./
 
 # 安装 pnpm 并安装依赖
-RUN npm install -g pnpm && pnpm install --frozen-lockfile
+RUN npm install -g pnpm@9 && pnpm install --frozen-lockfile
 
 # 复制前端源码并构建
 COPY frontend/ ./
@@ -104,7 +104,7 @@ RUN apt-get update && \
         libxft2 \
         libxinerama1 \
         libxtst6 \
-        libappindicator3-1 \
+        libayatana-appindicator3-1 \
         libx11-xcb1 \
         libxfixes3 \
         xdg-utils \
@@ -136,7 +136,7 @@ RUN mkdir -p /app/logs /app/data /app/backups /app/static/uploads/images && \
     chmod 777 /app/logs /app/data /app/backups /app/static/uploads /app/static/uploads/images
 
 # 创建非 root 运行用户（降低容器逃逸/提权风险）
-RUN groupadd -r appuser && useradd -r -g appuser -d /app -s /sbin/nologin appuser && \
+RUN groupadd -g 1000 appuser && useradd -u 1000 -g appuser -d /app -s /usr/sbin/nologin appuser && \
     chown -R appuser:appuser /app
 
 # 配置系统限制，防止core文件生成
