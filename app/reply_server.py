@@ -3046,6 +3046,92 @@ async def _enhance_qr_login_cookies(
     )
 
 
+@app.post("/cookie-login")
+async def login_with_pasted_cookie(
+    request: Dict[str, Any],
+    current_user: Dict[str, Any] = Depends(get_current_user)
+):
+    """用粘贴的 Cookie 直接添加/更新账号。
+
+    风控账号扫码后会被人脸/实名验证拦下，而验证的完成动作由浏览器端 JS 完成：
+    ivCheckLogin.htm 只是个 iframe 页面（加载 icbu-safe-check-min.js 做 postMessage），
+    服务端不在这条链路上下发 unb，纯接口轮询 hasLogin.do 也拿不到登录态。
+    此时从已登录的浏览器里复制 Cookie 是唯一可行的登录路径。
+    """
+    started_at = time.perf_counter()
+    try:
+        raw = str(request.get('cookie') or '').strip()
+        if not raw:
+            return {'success': False, 'message': 'Cookie 不能为空'}
+
+        # 容忍几种常见粘贴形式：带 "Cookie:" 前缀、多行、带引号
+        line = raw.splitlines()[0].strip()
+        if line.lower().startswith('cookie:'):
+            line = line[7:].strip()
+        line = line.strip().strip('"').strip("'")
+        if not line:
+            return {'success': False, 'message': 'Cookie 不能为空'}
+
+        cookie_fields = trans_cookies(line)
+        if not cookie_fields:
+            return {'success': False, 'message': 'Cookie 无法解析，格式应为 name=value; name2=value2'}
+
+        unb = str(cookie_fields.get('unb') or '').strip()
+        if not unb:
+            return {
+                'success': False,
+                'message': (
+                    'Cookie 里缺少 unb（闲鱼账号标识）。请从浏览器开发者工具的 '
+                    'Network → 任意 goofish.com 请求 → Request Headers → Cookie 整段复制；'
+                    '不要用 document.cookie（拿不到 httpOnly 字段）'
+                )
+            }
+
+        account_info = await process_qr_login_cookies(line, unb, current_user)
+        manager_operation = account_info.pop('_manager_operation', None)
+        log_with_user(
+            'info',
+            f"粘贴Cookie保存完成: 账号={account_info.get('account_id')}, "
+            f"新账号={account_info.get('is_new_account')}, 字段数={len(cookie_fields)}, "
+            f"耗时={time.perf_counter() - started_at:.2f}s",
+            current_user,
+        )
+
+        # 后台增强（刷新 Cookie / 补账号资料），不阻塞接口返回
+        async def _background_enhance():
+            try:
+                await _enhance_qr_login_cookies(
+                    session_id=f"paste:{account_info.get('account_id')}",
+                    account_info=account_info,
+                    cookies=line,
+                    current_user=dict(current_user),
+                    manager_operation=manager_operation,
+                )
+            except Exception as exc:
+                log_with_user(
+                    'warning',
+                    f"粘贴Cookie后台增强失败: 账号={account_info.get('account_id')}, "
+                    f"异常类型={type(exc).__name__}",
+                    current_user,
+                )
+
+        asyncio.create_task(_background_enhance())
+
+        return {
+            'success': True,
+            'account_id': account_info.get('account_id'),
+            'is_new_account': account_info.get('is_new_account'),
+            'message': (
+                f"账号已添加：{account_info.get('account_id')}"
+                if account_info.get('is_new_account')
+                else f"账号 Cookie 已更新：{account_info.get('account_id')}"
+            ),
+        }
+    except Exception as e:
+        log_with_user('error', f"粘贴Cookie登录失败: {type(e).__name__}: {e}", current_user)
+        return {'success': False, 'message': f'保存失败：{e}'}
+
+
 @app.post("/qr-login/refresh-cookies")
 async def refresh_cookies_from_qr_login(
     request: Dict[str, Any],

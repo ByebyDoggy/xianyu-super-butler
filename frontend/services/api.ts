@@ -97,6 +97,16 @@ export const checkQRLoginStatus = async (sessionId: string): Promise<any> => {
   return get(`/qr-login/check/${sessionId}`);
 };
 
+// 粘贴 Cookie 直接添加账号（风控账号人脸验证拿不到登录态时的兜底路径）
+export const addAccountByCookie = async (cookie: string): Promise<{
+  success: boolean;
+  account_id?: string;
+  is_new_account?: boolean;
+  message?: string;
+}> => {
+  return post('/cookie-login', { cookie });
+};
+
 export const updateAccountStatus = async (id: string, enabled: boolean): Promise<any> => {
   return put(`/cookies/${id}/status`, { enabled });
 };

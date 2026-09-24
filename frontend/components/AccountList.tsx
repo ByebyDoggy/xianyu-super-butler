@@ -7,6 +7,7 @@ import {
   deleteAccount,
   generateQRLogin,
   checkQRLoginStatus,
+  addAccountByCookie,
   updateAccountRemark,
   updateAccountAutoConfirm,
   updateAccountPauseDuration,
@@ -39,6 +40,10 @@ const AccountList: React.FC = () => {
     verification_url?: string;
   }>>([]);
   const [showQRModal, setShowQRModal] = useState(false);
+  // 粘贴 Cookie 添加账号：风控账号扫码会被人脸验证拦下，这是兜底登录路径
+  const [showCookieModal, setShowCookieModal] = useState(false);
+  const [cookieInput, setCookieInput] = useState('');
+  const [cookieSubmitting, setCookieSubmitting] = useState(false);
   const [qrCodeUrl, setQrCodeUrl] = useState<string>('');
   const [qrStatus, setQrStatus] = useState<string>('pending');
   const [qrMessage, setQrMessage] = useState<string>('');
@@ -527,6 +532,30 @@ const AccountList: React.FC = () => {
     setShowQRModal(false);
   };
 
+  const submitCookieLogin = async () => {
+    const cookie = cookieInput.trim();
+    if (!cookie) {
+      notify('请先粘贴 Cookie', 'error');
+      return;
+    }
+    setCookieSubmitting(true);
+    try {
+      const res = await addAccountByCookie(cookie);
+      if (res.success) {
+        notify(res.message || '账号已添加', 'success');
+        setShowCookieModal(false);
+        setCookieInput('');
+        loadAccounts();
+      } else {
+        notify(res.message || '添加失败', 'error');
+      }
+    } catch (e) {
+      notify(e instanceof Error ? e.message : '添加失败', 'error');
+    } finally {
+      setCookieSubmitting(false);
+    }
+  };
+
   const getRuntimeBadge = (account: AccountDetail) => {
     if (!account.enabled) {
       return { label: '已暂停', className: 'bg-gray-100 text-gray-500' };
@@ -587,13 +616,22 @@ const AccountList: React.FC = () => {
         icon={Users}
         badge={<span className="status-badge status-badge-info">{accounts.length} 个账号</span>}
         actions={(
-          <button
-            onClick={startQRLogin}
-            className="ios-btn-primary flex items-center justify-center gap-2 rounded-md px-4 py-2 text-sm"
-          >
-            <QrCode className="h-4 w-4" />
-            扫码添加账号
-          </button>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={() => setShowCookieModal(true)}
+              className="ios-btn-secondary flex items-center justify-center gap-2 rounded-md px-4 py-2 text-sm"
+            >
+              <Key className="h-4 w-4" />
+              粘贴 Cookie 添加
+            </button>
+            <button
+              onClick={startQRLogin}
+              className="ios-btn-primary flex items-center justify-center gap-2 rounded-md px-4 py-2 text-sm"
+            >
+              <QrCode className="h-4 w-4" />
+              扫码添加账号
+            </button>
+          </div>
         )}
       />
 
@@ -860,6 +898,70 @@ const AccountList: React.FC = () => {
               </div>
           </div>,
           document.body
+      )}
+
+      {/* 粘贴 Cookie 添加账号 */}
+      {showCookieModal && createPortal(
+        <div className="modal-overlay">
+          <div className="modal-container" style={{maxWidth: '34rem'}}>
+            <div className="modal-header flex items-start justify-between gap-4">
+              <div>
+                <h3 className="text-lg font-bold text-gray-900">粘贴 Cookie 添加账号</h3>
+                <p className="mt-1 text-xs text-gray-500">
+                  适用于被风控要求人脸验证的账号：自行在浏览器登录闲鱼后，把 Cookie 整串粘贴进来。
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setShowCookieModal(false)}
+                className="shrink-0 rounded-md p-2 hover:bg-gray-100"
+                aria-label="关闭粘贴 Cookie"
+              >
+                <X className="h-5 w-5 text-gray-500" />
+              </button>
+            </div>
+
+            <div className="modal-body space-y-3 py-5">
+              <textarea
+                value={cookieInput}
+                onChange={(e) => setCookieInput(e.target.value)}
+                placeholder="unb=xxx; cookie2=xxx; _tb_token_=xxx; ..."
+                className="ios-input h-40 w-full resize-y rounded-md px-3 py-2.5 font-mono text-xs"
+              />
+              <div className="rounded-md border border-amber-200 bg-amber-50 p-3 text-xs leading-5 text-amber-800">
+                <div className="font-bold mb-1">怎么拿到这段 Cookie</div>
+                <div>1. 在<b>已登录闲鱼</b>的浏览器里按 F12 打开开发者工具</div>
+                <div>2. 切到 <span className="font-mono">Network</span>，随便点一个 goofish.com 的请求</div>
+                <div>3. 找到 <span className="font-mono">Request Headers</span> 里的 <span className="font-mono">Cookie</span>，整段值复制过来</div>
+                <div className="mt-1">
+                  不要用 <span className="font-mono">document.cookie</span>：它拿不到 httpOnly 的{' '}
+                  <span className="font-mono">unb</span>（账号标识），会提示缺少 unb。
+                </div>
+              </div>
+              <p className="text-xs text-gray-500">当前长度：{cookieInput.trim().length} 字符</p>
+            </div>
+
+            <div className="modal-footer flex items-center justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => setShowCookieModal(false)}
+                className="ios-btn-secondary rounded-md px-4 py-2 text-sm"
+              >
+                取消
+              </button>
+              <button
+                type="button"
+                onClick={submitCookieLogin}
+                disabled={cookieSubmitting}
+                className="ios-btn-primary flex items-center gap-2 rounded-md px-4 py-2 text-sm"
+              >
+                {cookieSubmitting ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}
+                保存并添加
+              </button>
+            </div>
+          </div>
+        </div>,
+        document.body
       )}
 
       {/* 编辑账号弹窗 */}
