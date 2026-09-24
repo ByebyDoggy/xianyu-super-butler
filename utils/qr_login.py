@@ -66,6 +66,9 @@ class QRLoginSession:
         self.verification_qr_code_url = None  # 验证URL的二维码，生成一次后复用
         self.verification_extended = False
         self.last_remote_status = None
+        self.last_login_check_ts = 0.0  # 登录态接口节流
+        # 登录二维码是否已被平台置为 EXPIRED（说明流程已交给风控 IV）
+        self.qr_consumed = False
 
     def extend_for_verification(self) -> None:
         """进入手机验证后延长会话寿命，只延一次。"""
@@ -315,6 +318,66 @@ class QRLoginManager:
             )
             return resp
 
+    async def _check_login_completed(self, session: QRLoginSession) -> bool:
+        """通过登录态接口确认验证是否走完，并收取登录 Cookie。
+
+        登录二维码一旦交给风控验证（IV）流程，平台就会把它标记为 EXPIRED，
+        继续轮询 query.do 永远拿不到带登录态的 CONFIRMED。此时必须改查
+        登录态接口：用户在手机上刷完脸后，hasLogin 会成功并下发 unb 等 Cookie。
+        """
+        url = f"{self.host}/newlogin/hasLogin.do"
+        params = {
+            'appName': 'xianyu',
+            'fromSite': '77',
+            'ltl': 'true',
+            'documentReferer': 'https://www.goofish.com/',
+        }
+        data = {
+            'hid': session.cookies.get('unb', ''),
+            'ltl': 'true',
+            'appName': 'xianyu',
+            'appEntrance': 'web',
+            '_csrf_token': session.cookies.get('XSRF-TOKEN', ''),
+            'umidToken': '',
+            'hsiz': session.cookies.get('cookie2', ''),
+            'mainPage': 'false',
+            'isMobile': 'false',
+            'lang': 'zh_CN',
+            'returnUrl': '',
+            'fromSite': '77',
+            'isIframe': 'true',
+            'documentReferer': 'https://www.goofish.com/',
+            'defaultView': 'hasLogin',
+            'umidTag': 'SERVER',
+            'deviceId': session.cookies.get('cna', ''),
+        }
+        async with httpx.AsyncClient(
+            timeout=self.timeout, follow_redirects=True, proxy=self.proxy
+        ) as client:
+            resp = await client.post(
+                url,
+                params=params,
+                data=data,
+                cookies=session.cookies,
+                headers=self.headers,
+            )
+            # 先收 Cookie：登录态接口这一轮响应里才会下发 unb
+            for k, v in resp.cookies.items():
+                session.cookies[k] = v
+                if k == 'unb':
+                    session.unb = v
+            try:
+                res_json = resp.json()
+            except ValueError:
+                logger.warning(f"登录态接口返回非JSON: {session.session_id}")
+                return False
+            success = bool(res_json.get('content', {}).get('success'))
+            logger.debug(
+                f"登录态检查: {session.session_id}, success={success}, "
+                f"unb={session.unb or '缺失'}, 响应Cookie字段={sorted(resp.cookies.keys())}"
+            )
+            return success and bool(session.unb)
+
     async def _monitor_qr_status(self, session_id: str):
         """监控二维码状态"""
         try:
@@ -349,6 +412,25 @@ class QRLoginManager:
                             f"响应Cookie字段: {sorted(resp.cookies.keys())}"
                         )
                         session.last_remote_status = qrcode_status
+
+                    # 风控验证期间：无论平台把登录二维码标成 CONFIRMED（无 unb）还是
+                    # EXPIRED，都用登录态接口确认用户是否在手机上完成了人脸/短信验证。
+                    # 节流到 2.5 秒一次，避免无间隔请求把 IP 送进风控。
+                    if session.status == 'verification_required':
+                        now_ts = time.time()
+                        if now_ts - session.last_login_check_ts >= 2.5:
+                            session.last_login_check_ts = now_ts
+                            try:
+                                if await self._check_login_completed(session):
+                                    session.status = 'success'
+                                    logger.info(
+                                        f"手机验证完成，已取得账号Cookie: {session_id}, "
+                                        f"UNB: {session.unb or '缺失'}, "
+                                        f"字段数: {len(session.cookies)}"
+                                    )
+                                    break
+                            except Exception as e:
+                                logger.error(f"登录态检查异常: {session_id}, {e}")
 
                     if qrcode_status == "CONFIRMED":
                         data = (
@@ -409,6 +491,18 @@ class QRLoginManager:
                         continue
 
                     elif qrcode_status == "EXPIRED":
+                        # 进入风控验证后，登录二维码会被平台立刻置为 EXPIRED：
+                        # 它已经把流程交给了 IV（人脸/短信验证）。这既不是用户取消，
+                        # 也不是登录失败 —— 此时必须继续等用户在手机上完成验证，
+                        # 并改由登录态接口（hasLogin）收尾，否则用户验证走完了
+                        # 这边也永远收不到回调，只会停在「账号未登录完成」。
+                        if session.status == 'verification_required':
+                            session.qr_consumed = True
+                            logger.info(
+                                f"二维码已交给风控验证流程，继续等待手机验证: {session_id}"
+                            )
+                            await asyncio.sleep(1.5)
+                            continue
                         # 二维码已过期
                         session.status = 'expired'
                         logger.info(f"二维码已过期: {session_id}")
