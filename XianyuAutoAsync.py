@@ -17,7 +17,8 @@ from app.config import (
     WEBSOCKET_URL, HEARTBEAT_INTERVAL, HEARTBEAT_TIMEOUT,
     TOKEN_REFRESH_INTERVAL, TOKEN_RETRY_INTERVAL, COOKIES_STR,
     LOG_CONFIG, AUTO_REPLY, DEFAULT_HEADERS, WEBSOCKET_HEADERS,
-    APP_CONFIG, API_ENDPOINTS, SLIDER_VERIFICATION, browser_headless
+    APP_CONFIG, API_ENDPOINTS, SLIDER_VERIFICATION, browser_headless,
+    RECONNECT
 )
 from app.config import config as cfg  # 导入config实例（不是模块），使用别名避免冲突
 import sys
@@ -174,6 +175,15 @@ logger.add(
     format=LOG_CONFIG.get('format', '<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>'),
     enqueue=True
 )
+
+# 重连策略（global_config.yml → RECONNECT）
+# 背景：风控期间每 60 秒重连一次 = 对已被限流的账号持续加压，平台会据此不断
+# 续期封控（RGV587「哎哟喂,被挤爆啦」就是这个意思），于是永远出不来。
+RECONNECT_AUTO = bool(RECONNECT.get('auto', True))
+try:
+    RECONNECT_INTERVAL = int(RECONNECT.get('interval', 0) or 0)
+except (TypeError, ValueError):
+    RECONNECT_INTERVAL = 0
 
 class XianyuLive:
     # 类级别的锁字典，为每个order_id维护一个锁（用于自动发货）
@@ -10739,8 +10749,34 @@ class XianyuLive:
                     # 只看 error_msg 会退避不足（20 秒一次），因此同时查熔断状态。
                     from utils import risk_control
 
+                    # 重连总开关（global_config.yml → RECONNECT.auto）
+                    if not RECONNECT_AUTO:
+                        logger.error(
+                            f"【{self.cookie_id}】自动重连已禁用（RECONNECT.auto=false），"
+                            f"不再自动重连。账号转入停止状态，处理完再手动启用账号。"
+                        )
+                        self._set_connection_state(
+                            ConnectionState.FAILED,
+                            "自动重连已禁用（RECONNECT.auto=false）",
+                        )
+                        return
+
                     guard = risk_control.registry.get(self.cookie_id)
-                    if guard.is_blocked:
+                    if RECONNECT_INTERVAL > 0:
+                        # 固定间隔优先。风控场景下这个值应该设得很大（例如 3600），
+                        # 否则每次重连都在给已经限流的账号再添一把火。
+                        retry_delay = RECONNECT_INTERVAL
+                        if guard.is_blocked:
+                            retry_delay = max(retry_delay, guard.remaining_seconds + 5)
+                            logger.warning(
+                                f"【{self.cookie_id}】风控冷却中（剩余 {guard.remaining_seconds} 秒），"
+                                f"按固定重连间隔 {retry_delay} 秒后重试连接"
+                            )
+                        else:
+                            logger.warning(
+                                f"【{self.cookie_id}】按固定重连间隔 {retry_delay} 秒后重试连接"
+                            )
+                    elif guard.is_blocked:
                         retry_delay = max(guard.remaining_seconds + 5, 60)
                         logger.warning(
                             f"【{self.cookie_id}】风控冷却中，将在 {retry_delay} 秒后重试连接"

@@ -104,6 +104,10 @@ SLIDER_VERIFICATION = config.get('SLIDER_VERIFICATION', {
     'max_concurrent': 3,
     'wait_timeout': 60
 })
+RECONNECT = config.get('RECONNECT', {
+    'auto': True,
+    'interval': 0
+})
 BROWSER = config.get('BROWSER', {'headless': False})
 
 

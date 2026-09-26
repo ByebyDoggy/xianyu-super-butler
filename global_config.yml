@@ -81,6 +81,17 @@ SLIDER_VERIFICATION:
   auto_solve: false
   # 出现验证（滑块/人脸）时，是否通过「通知与日志」里已配置的渠道提醒你
   notify_on_verification: true
+RECONNECT:
+  # 连接失败后是否自动重连。
+  #   true  = 自动重连（间隔见下面的 interval）
+  #   false = 彻底不再自动重连：任务直接退出，账号停在停止状态，等你手动启用
+  auto: true
+  # 自动重连间隔（秒）。0 = 用内置指数退避
+  #   （风控场景最长 30 分钟，普通网络抖动几十秒）。
+  # 为什么要调大：风控期间每 60 秒重连一次 = 对已经被限流的账号持续加压，
+  # 平台会据此不断续期封控（RGV587「哎哟喂,被挤爆啦」就是这个意思），结果永远出不来。
+  # 3600 = 1 小时一次。风控冷却期比这个长时会自动沿用冷却剩余时间。
+  interval: 3600
 WEBSOCKET_HEADERS:
   Accept-Encoding: gzip, deflate, br, zstd
   Accept-Language: zh-CN,zh;q=0.9
