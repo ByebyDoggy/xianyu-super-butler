@@ -5,6 +5,7 @@ import { getCards, createCard, updateCard, deleteCard } from '../services/api';
 import { confirmAction, notify } from '../services/feedback';
 import { Plus, CreditCard, FileText, Image as ImageIcon, Code, Edit, Trash2, Save, X, Package, Boxes } from 'lucide-react';
 import { EmptyState, PageHeader, SectionHeader } from './ui';
+import VariableHint, { API_CARD_VARIABLES, DELIVERY_VARIABLES } from './VariableHint';
 
 const CardList: React.FC = () => {
   const [cards, setCards] = useState<Card[]>([]);
@@ -448,7 +449,12 @@ const CardList: React.FC = () => {
                         value={editForm.api_params || ''}
                         onChange={(e) => setEditForm({ ...editForm, api_params: e.target.value })}
                         className="ios-input h-20 w-full resize-y rounded-md px-3 py-2.5 font-mono text-sm"
-                        placeholder='{"type": "card", "count": 1}'
+                        placeholder='{"type": "card", "order": "{order_id}"}'
+                      />
+                      <VariableHint
+                        variables={API_CARD_VARIABLES}
+                        title="请求参数里可用的变量"
+                        note="URL、请求头、请求参数里都能用；其中订单金额/数量/商品详情需要能查到对应订单或商品时才会替换。"
                       />
                     </div>
                   </div>
@@ -546,19 +552,18 @@ const CardList: React.FC = () => {
                     className="ios-input h-32 w-full resize-y rounded-md px-3 py-2.5"
                     placeholder={'例如：您好，你的卡密是{key} 请注意查收'}
                   />
-                  <div className="mt-1 space-y-0.5 text-xs leading-5 text-gray-500">
-                    <p>
-                      用 <span className="font-mono">{'{key}'}</span>（或{' '}
-                      <span className="font-mono">{'{DELIVERY_CONTENT}'}</span>）代表卡密内容。
-                      文案里含这个变量时，整段备注就是最终发送内容；不含时，备注会放在卡密前面。
-                    </p>
-                    <p>
-                      其它变量：<span className="font-mono">{'{card_name}'}</span> 卡密名称、
-                      <span className="font-mono">{'{item_title}'}</span> 商品标题、
-                      <span className="font-mono">{'{buyer_id}'}</span> 买家ID、
-                      <span className="font-mono">{'{order_id}'}</span> 订单号。
-                    </p>
-                  </div>
+                  <VariableHint
+                    variables={DELIVERY_VARIABLES}
+                    title="发货语里可用的变量"
+                    note={
+                      <>
+                        文案里含 <span className="font-mono">{'{key}'}</span>
+                        （或 <span className="font-mono">{'{DELIVERY_CONTENT}'}</span>）时，
+                        整段备注就是最终发送内容；不含时，备注会放在卡密前面。
+                        图片类卡密不参与替换。
+                      </>
+                    }
+                  />
                 </div>
 
                 {/* 启用状态 */}
@@ -723,13 +728,16 @@ const CardList: React.FC = () => {
                     placeholder={'例如：您好，你的卡密是{key} 请注意查收'}
                     className="ios-input h-20 w-full resize-y rounded-md px-3 py-2.5"
                   />
-                  <p className="mt-1 text-xs leading-5 text-gray-500">
-                    用 <span className="font-mono">{'{key}'}</span> 代表卡密内容；
-                    还支持 <span className="font-mono">{'{card_name}'}</span>、
-                    <span className="font-mono">{'{item_title}'}</span>、
-                    <span className="font-mono">{'{buyer_id}'}</span>、
-                    <span className="font-mono">{'{order_id}'}</span>。
-                  </p>
+                  <VariableHint
+                    variables={DELIVERY_VARIABLES}
+                    title="发货语里可用的变量"
+                    note={
+                      <>
+                        含 <span className="font-mono">{'{key}'}</span> 时整段就是最终文案；
+                        不含时备注会放在卡密前面。图片类卡密不参与替换。
+                      </>
+                    }
+                  />
                 </div>
 
                 <div>

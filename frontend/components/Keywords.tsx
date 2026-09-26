@@ -5,6 +5,7 @@ import { getAccountDetails, getReplyRules, updateReplyRule, deleteReplyRule, get
 import { Plus, Trash2, MessageSquare, X, Save, Key, Truck, Power, PowerOff, Edit2, RefreshCw, Sparkles, Bot } from 'lucide-react';
 import { confirmAction, notify } from '../services/feedback';
 import { EmptyState, PageHeader, PageLoading, PageTabs, SectionHeader } from './ui';
+import VariableHint, { REPLY_VARIABLES } from './VariableHint';
 
 type ReplyTabType = 'reply' | 'default';
 type KeywordsMode = 'reply' | 'delivery';
@@ -656,10 +657,11 @@ const Keywords: React.FC<KeywordsProps> = ({ mode }) => {
                 <textarea
                   value={replyForm.reply_content}
                   onChange={(event) => setReplyForm({ ...replyForm, reply_content: event.target.value })}
-                  placeholder="输入自动回复内容"
+                  placeholder="输入自动回复内容，可用 {send_user_name} 等变量"
                   rows={7}
                   className="ios-input w-full resize-y rounded-md px-3 py-2.5"
                 />
+                <VariableHint variables={REPLY_VARIABLES} title="回复内容里可用的变量" />
               </label>
             </div>
             <div className="modal-footer flex justify-end gap-2">
@@ -812,10 +814,11 @@ const Keywords: React.FC<KeywordsProps> = ({ mode }) => {
                 <textarea
                   value={defaultForm.reply_content}
                   onChange={(event) => setDefaultForm({ ...defaultForm, reply_content: event.target.value })}
-                  placeholder="输入默认回复内容"
+                  placeholder="输入默认回复内容，可用 {send_user_name} 等变量"
                   rows={7}
                   className="ios-input w-full resize-y rounded-md px-3 py-2.5"
                 />
+                <VariableHint variables={REPLY_VARIABLES} title="回复内容里可用的变量" />
               </label>
               <label className="block">
                 <span className="field-label">回复图片 URL（可选）</span>
