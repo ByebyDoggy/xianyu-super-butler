@@ -5956,6 +5956,10 @@ async def search_items(
 
         return response_data
 
+    except HTTPException:
+        # 不能把自定义状态码（如越权的403）当普通异常吞成 500：
+        # 这里必须先放行，否则前端只能看到一个含糊的“搜索失败”。
+        raise
     except Exception as e:
         error_msg = str(e)
         logger.error(f"{user_info} 商品搜索失败: {error_msg}")
@@ -6061,6 +6065,8 @@ async def search_multiple_pages(
 
         return response_data
 
+    except HTTPException:
+        raise
     except Exception as e:
         error_msg = str(e)
         logger.error(f"{user_info} 多页商品搜索失败: {error_msg}")

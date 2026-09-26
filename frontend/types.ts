@@ -576,3 +576,32 @@ export interface AnnouncementPayload {
   error: string;
   announcements: AnnouncementItem[];
 }
+
+// 闲鱼商品搜索结果（POST /items/search）
+export interface SearchItem {
+  item_id: string;
+  title: string;
+  price: string;
+  seller_name?: string;
+  item_url?: string;
+  main_image?: string;
+  publish_time?: string;
+  tags?: string[];
+  area?: string;
+  want_count?: number;
+}
+
+export interface ItemSearchResult {
+  success: boolean;
+  data: SearchItem[];
+  total: number;
+  page?: number;
+  page_size?: number;
+  total_pages?: number;
+  keyword: string;
+  // 后端拉不到真实结果时会回退成模拟数据，这里用来提示用户别当真
+  is_real_data?: boolean;
+  is_fallback?: boolean;
+  source?: string;
+  error?: string;
+}

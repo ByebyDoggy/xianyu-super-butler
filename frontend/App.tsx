@@ -11,6 +11,7 @@ const AccountList = lazy(() => import('./components/AccountList'));
 const OrderList = lazy(() => import('./components/OrderList'));
 const CardList = lazy(() => import('./components/CardList'));
 const ItemList = lazy(() => import('./components/ItemList'));
+const ItemSearch = lazy(() => import('./components/ItemSearch'));
 const ProductAutomation = lazy(() => import('./components/ProductAutomation'));
 const AIReply = lazy(() => import('./components/AIReply'));
 const Settings = lazy(() => import('./components/Settings'));
@@ -31,6 +32,7 @@ const pageLabels: Record<string, string> = {
   dashboard: '总览',
   accounts: '账号管理',
   items: '商品与发货',
+  'item-search': '商品搜索',
   orders: '订单管理',
   'buyer-interaction': '买家互动',
   cards: '卡密库存',
@@ -506,6 +508,9 @@ const App: React.FC = () => {
           </section>
           <section hidden={activeTab !== 'items'}>
             <Suspense fallback={activeTab === 'items' ? <PageLoader /> : null}><ItemList /></Suspense>
+          </section>
+          <section hidden={activeTab !== 'item-search'}>
+            <Suspense fallback={activeTab === 'item-search' ? <PageLoader /> : null}><ItemSearch /></Suspense>
           </section>
           <section hidden={activeTab !== 'product-automation'}>
             <Suspense fallback={activeTab === 'product-automation' ? <PageLoader /> : null}><ProductAutomation /></Suspense>

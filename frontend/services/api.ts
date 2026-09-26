@@ -10,7 +10,7 @@ import {
   , ChatAccount, ChatConversation, ChatMessage, ProductMaterial,
   ProductFilterRule, ProductDeleteRule, AutomationTaskRun,
   ProductAutomationResult, ProductDeletePreview, QuickPhrase,
-  AnnouncementPayload
+  AnnouncementPayload, ItemSearchResult
 } from '../types';
 
 // Auth
@@ -105,6 +105,27 @@ export const addAccountByCookie = async (cookie: string): Promise<{
   message?: string;
 }> => {
   return post('/cookie-login', { cookie });
+};
+
+// 商品搜索：后端会真的拉起浏览器去闲鱼搜，首次可能要几十秒，超时给足。
+// cookie_id 决定用哪个账号（同时也决定用哪份浏览器 profile）；
+// 不传则由后端在当前后台用户的账号里挑一个可用的。
+export const searchItems = async (data: {
+  keyword: string;
+  page?: number;
+  page_size?: number;
+  cookie_id?: string;
+}): Promise<ItemSearchResult> => {
+  return post('/items/search', data, { timeout: 5 * 60 * 1000 });
+};
+
+// 多页搜索：一次翻多页，后端同样拉起浏览器
+export const searchItemsMultiplePages = async (data: {
+  keyword: string;
+  total_pages?: number;
+  cookie_id?: string;
+}): Promise<ItemSearchResult> => {
+  return post('/items/search_multiple', data, { timeout: 10 * 60 * 1000 });
 };
 
 // 用本地有头浏览器登录闲鱼：弹出的窗口里完成扫码/账号密码/滑块/人脸，
