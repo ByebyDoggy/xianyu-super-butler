@@ -385,6 +385,7 @@ class XianyuSliderStealth:
         self.context = None
         self.playwright = None
         self._browser_slot_held = False  # 是否占用着全局浏览器槽位
+        self._profile_held = False  # 是否占用着该账号的浏览器 profile
         self._stealth_engine = 'patchright' if PATCHRIGHT_AVAILABLE else 'playwright'
         
         # 提取纯用户ID（移除时间戳部分）
@@ -451,6 +452,14 @@ class XianyuSliderStealth:
             if not self._browser_slot_held:
                 browser_limit.acquire_slot("滑块验证")
                 self._browser_slot_held = True
+
+            # 同一账号的持久化 profile 是独占的：抢不到时宁可在这里明确报错，
+            # 也不要拿到一个“页面能开、一操作就卡死”的半个浏览器。
+            if not self._profile_held:
+                from utils.browser_profile import acquire_profile
+
+                acquire_profile(self.pure_user_id, "滑块验证")
+                self._profile_held = True
 
             # 启动 Playwright。优先 Patchright：同一份 Chromium 下它能把
             # navigator.webdriver 从 true 变成 false，少掉一个最容易被查的标志。
@@ -633,6 +642,12 @@ class XianyuSliderStealth:
         if self._browser_slot_held:
             self._browser_slot_held = False
             browser_limit.release_slot("滑块验证")
+
+        if self._profile_held:
+            self._profile_held = False
+            from utils.browser_profile import release_profile
+
+            release_profile(self.pure_user_id, "滑块验证")
     
     def _load_success_history(self) -> List[Dict[str, Any]]:
         """加载历史成功数据"""
@@ -2384,6 +2399,12 @@ class XianyuSliderStealth:
         if self._browser_slot_held:
             self._browser_slot_held = False
             browser_limit.release_slot("滑块验证")
+
+        if self._profile_held:
+            self._profile_held = False
+            from utils.browser_profile import release_profile
+
+            release_profile(self.pure_user_id, "滑块验证")
         
         # 注销实例（最后执行，确保其他清理完成）
         try:

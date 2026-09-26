@@ -22,9 +22,12 @@ cache / 已访问域名）。项目里有一条实测结论：Playwright 自带�
 这里统一为 browser_data/account_<id>，并把老的 slider_<id> 目录**迁移**过来 ——
 那些目录里已经有"养"出来的真实指纹和访问历史，丢掉反而更容易被风控盯上。
 """
+import asyncio
 import json
 import os
 import shutil
+import threading
+from contextlib import contextmanager
 from typing import Any, Dict
 
 from loguru import logger
@@ -206,6 +209,87 @@ def launch_args(window_size: str = '1920,1080') -> list:
         '--password-store=basic',
         '--use-mock-keychain',
     ]
+
+
+# 每个 profile 目录同一时刻只能被一个浏览器占用 —— Chromium 自己靠单例锁拦，
+# 但两个流程同时去抢同一份目录时，抢不到的那个往往不会痛快报错，
+# 而是拿到一个“半可用”的浏览器：页面能打开，一操作就卡死。
+# 那种现象极难排查，所以进程内再上一道互斥，抢不到的直接报错说清楚。
+_profile_locks: Dict[str, threading.Lock] = {}
+_profile_locks_guard = threading.Lock()
+PROFILE_ACQUIRE_TIMEOUT = 300
+
+
+def _lock_key(cookie_id: Any) -> str:
+    return safe_profile_name(cookie_id) if cookie_id else STAGING_PROFILE_NAME
+
+
+def profile_lock(cookie_id: Any) -> threading.Lock:
+    """取该 profile 对应的进程内互斥锁（惰性创建）。"""
+    key = _lock_key(cookie_id)
+    with _profile_locks_guard:
+        lock = _profile_locks.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _profile_locks[key] = lock
+        return lock
+
+
+def acquire_profile(cookie_id: Any, purpose: str = '浏览器任务') -> None:
+    """同步占用该账号的 profile。用于启动与关闭分处两个方法的同步流程（如滑块验证）。
+
+    取到后必须调用 release_profile 归还，否则下一次任务会一直等。
+    """
+    lock = profile_lock(cookie_id)
+    if not lock.acquire(True, PROFILE_ACQUIRE_TIMEOUT):
+        raise TimeoutError(
+            f'{purpose}: 账号 {cookie_id or "新账号"} 的浏览器 profile 被其他任务占用'
+            f'超过 {PROFILE_ACQUIRE_TIMEOUT} 秒。'
+            '同一账号不能同时开两个浏览器（持久化目录是独占的），'
+            '请等上一个任务结束。'
+        )
+
+
+def release_profile(cookie_id: Any, purpose: str = '浏览器任务') -> None:
+    """归还 acquire_profile 取得的占用。重复调用会被忽略。"""
+    try:
+        profile_lock(cookie_id).release()
+    except RuntimeError:
+        # 归还次数多于取用次数，说明配对有误；记录但不影响主流程
+        logger.warning(f'{purpose}: 浏览器 profile 占用重复归还，已忽略')
+
+
+@contextmanager
+def hold_profile(cookie_id: Any, purpose: str = '浏览器任务'):
+    """同步上下文：本代码块内独占该账号的 profile。"""
+    acquire_profile(cookie_id, purpose)
+    try:
+        yield
+    finally:
+        release_profile(cookie_id, purpose)
+
+
+async def acquire_profile_async(cookie_id: Any, purpose: str = '浏览器任务') -> None:
+    """异步占用该账号的 profile（在线程里等锁，不阻塞事件循环）。
+
+    取到后必须调用 release_profile_async 归还。
+    """
+    lock = profile_lock(cookie_id)
+    acquired = await asyncio.to_thread(lock.acquire, True, PROFILE_ACQUIRE_TIMEOUT)
+    if not acquired:
+        raise TimeoutError(
+            f'{purpose}: 账号 {cookie_id or "新账号"} 的浏览器 profile 被其他任务占用'
+            f'超过 {PROFILE_ACQUIRE_TIMEOUT} 秒。'
+            '同一账号不能同时开两个浏览器（持久化目录是独占的），请等上一个任务结束。'
+        )
+
+
+async def release_profile_async(cookie_id: Any, purpose: str = '浏览器任务') -> None:
+    """归还 acquire_profile_async 取得的占用。重复调用会被忽略。"""
+    try:
+        profile_lock(cookie_id).release()
+    except RuntimeError:
+        logger.warning(f'{purpose}: 浏览器 profile 占用重复归还，已忽略')
 
 
 async def launch_shared_context(

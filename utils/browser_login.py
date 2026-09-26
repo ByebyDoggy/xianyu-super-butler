@@ -81,9 +81,11 @@ async def open_login_session(
         ``{"success": bool, "message": str, "cookies_str": str, "unb": str}``
     """
     from utils.browser_profile import (
+        acquire_profile_async,
         clean_singleton_lock_files,
         launch_shared_context,
         profile_dir,
+        release_profile_async,
         staging_profile_dir,
     )
 
@@ -108,6 +110,7 @@ async def open_login_session(
 
     playwright = None
     context = None
+    profile_held = False
     result: Dict[str, Any] = {
         'success': False,
         'message': '',
@@ -117,6 +120,11 @@ async def open_login_session(
     }
 
     try:
+        # 同一账号的 profile 是独占的：已经有别的流程在用它（过验证、取订单…）时，
+        # 宁可现在就说清楚，也不要开出第二个浏览器把 profile 弄成半损坏状态。
+        await acquire_profile_async(cookie_id or None, '本地浏览器登录')
+        profile_held = True
+
         playwright, engine = await _start_playwright()
         logger.info(f'【{label}】浏览器内核: {engine}')
 
@@ -223,3 +231,5 @@ async def open_login_session(
                 await playwright.stop()
             except Exception:
                 pass
+        if profile_held:
+            await release_profile_async(cookie_id or None, '本地浏览器登录')

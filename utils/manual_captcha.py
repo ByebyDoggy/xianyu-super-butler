@@ -182,7 +182,15 @@ async def open_manual_session(
     browser = None
     context = None
     refresh_task = None
+    profile_held = False
     try:
+        # 同一账号的 profile 是独占的（登录 / 滑块 / 取订单共用一份），
+        # 先拿到占用再启动，抢不到就明确报错。
+        from utils.browser_profile import acquire_profile_async
+
+        await acquire_profile_async(cookie_id, '人工验证码')
+        profile_held = True
+
         playwright = await async_playwright().start()
 
         # 与登录 / 滑块共用同一个持久化 profile：平台会把“登录”和“过验证”看成
@@ -303,6 +311,10 @@ async def open_manual_session(
                 await playwright.stop()
             except Exception:
                 pass
+        if profile_held:
+            from utils.browser_profile import release_profile_async
+
+            await release_profile_async(cookie_id, '人工验证码')
 
 
 async def _wait_for_captcha_present(page, timeout: int = CAPTCHA_PRESENT_TIMEOUT) -> bool:
