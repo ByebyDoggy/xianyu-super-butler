@@ -434,11 +434,27 @@ async def health_check():
 async def serve_frontend():
     """服务 React 前端 SPA"""
     index_path = os.path.join(static_dir, 'index.html')
+
+    # index.html 必须禁用缓存。它引用的是带 hash 的产物文件名：一旦 HTML 被浏览器
+    # 启发式缓存（FastAPI 的 HTMLResponse 默认不带 Cache-Control，浏览器就会按
+    # Last-Modified 推算保鲜期），前端重新构建后用户仍然在加载旧 bundle ——
+    # 而旧 bundle 已被 clean-build-output 删掉，只能靠浏览器缓存命中。
+    # 表现就是「明明构建了、也重启了，界面上却看不到新东西」。
+    # 带 hash 的 /assets/* 仍然可以长期缓存，这里只对 HTML 生效。
+    no_cache_headers = {
+        'Cache-Control': 'no-cache, no-store, must-revalidate',
+        'Pragma': 'no-cache',
+        'Expires': '0',
+    }
+
     if os.path.exists(index_path):
         with open(index_path, 'r', encoding='utf-8') as f:
-            return HTMLResponse(f.read())
+            return HTMLResponse(f.read(), headers=no_cache_headers)
     else:
-        return HTMLResponse('<h3>Frontend not found. Please build the frontend first.</h3>')
+        return HTMLResponse(
+            '<h3>Frontend not found. Please build the frontend first.</h3>',
+            headers=no_cache_headers,
+        )
 
 @app.get('/', response_class=HTMLResponse)
 async def root():
