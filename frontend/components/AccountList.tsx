@@ -177,7 +177,7 @@ const AccountList: React.FC = () => {
       }
       if (result.verification_url) {
         window.open(result.verification_url, '_blank', 'noopener,noreferrer');
-        notify('已打开验证页，请用鼠标拖动滑块完成验证', 'info');
+        notify('已打开验证页，请过完滑块后点「② 回填 Cookie」把浏览器 Cookie 粘回来', 'info');
       }
     } catch (error) {
       notify(error instanceof Error ? error.message : '获取验证链接失败', 'error');
@@ -723,20 +723,34 @@ const AccountList: React.FC = () => {
                   <div className="mt-2 rounded-md bg-amber-50 px-3 py-2 text-xs leading-5 text-amber-900">
                     <p className="font-bold">闲鱼要求完成人机验证，账号暂时拿不到令牌</p>
                     <p className="mt-1">
-                      推荐用你自己的浏览器打开验证页、用真实鼠标拖动滑块，通过率远高于服务器自动拖动。
-                      验证通过后本页会自动恢复，无需重新扫码。
+                      推荐用你自己的浏览器过滑块（通过率远高于服务器自动拖动）。注意：
+                      <b>通行凭证 x5sec 只会留在你自己的浏览器里</b>，服务器拿不到，
+                      所以过完滑块后还得把 Cookie 回填回来。分两步：
                     </p>
-                    <button
-                      type="button"
-                      onClick={() => handleOpenFreshCaptcha(account.id)}
-                      disabled={freshUrlLoadingId === account.id}
-                      className="mt-2 inline-flex items-center gap-1.5 rounded-full bg-[#ffe100] px-3 py-1.5 font-bold text-[#2a2416] hover:bg-[#ffd700] disabled:opacity-60"
-                    >
-                      {freshUrlLoadingId === account.id
-                        ? <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                        : <ShieldCheck className="h-3.5 w-3.5" />}
-                      在我的浏览器打开验证页
-                    </button>
+                    <div className="mt-2 flex flex-wrap items-center gap-2">
+                      <button
+                        type="button"
+                        onClick={() => handleOpenFreshCaptcha(account.id)}
+                        disabled={freshUrlLoadingId === account.id}
+                        className="inline-flex items-center gap-1.5 rounded-full bg-[#ffe100] px-3 py-1.5 font-bold text-[#2a2416] hover:bg-[#ffd700] disabled:opacity-60"
+                      >
+                        {freshUrlLoadingId === account.id
+                          ? <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                          : <ShieldCheck className="h-3.5 w-3.5" />}
+                        ① 在我的浏览器打开验证页
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setShowCookieModal(true)}
+                        className="inline-flex items-center gap-1.5 rounded-full bg-white px-3 py-1.5 font-bold text-amber-900 ring-1 ring-amber-300 hover:bg-amber-100"
+                      >
+                        <Key className="h-3.5 w-3.5" />
+                        ② 回填 Cookie
+                      </button>
+                    </div>
+                    <p className="mt-1.5 text-[11px] text-amber-700">
+                      回填时用开发者工具 Network → Request Headers → Cookie 整段复制（要含 x5sec）。
+                    </p>
                   </div>
                 )}
               </div>

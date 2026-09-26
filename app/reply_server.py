@@ -1972,16 +1972,22 @@ def update_cookie(cid: str, item: CookieIn, current_user: Dict[str, Any] = Depen
         old_cookie_details = db_manager.get_cookie_details(cid)
         old_cookie_value = old_cookie_details.get('value') if old_cookie_details else None
 
+        # 与 process_qr_login_cookies 一致：回填带 x5sec 的 Cookie 时，
+        # 必须清掉 x5secdata 等挑战标记，否则闲鱼仍认为验证没做完。
+        from utils.xianyu_utils import drop_stale_captcha_challenge
+
+        new_value = drop_stale_captcha_challenge(item.value)
+
         # 使用 update_cookie_account_info 更新（只更新cookie值，不覆盖其他字段）
-        success = db_manager.update_cookie_account_info(cid, cookie_value=item.value)
-        
+        success = db_manager.update_cookie_account_info(cid, cookie_value=new_value)
+
         if not success:
             raise HTTPException(status_code=400, detail="更新Cookie失败")
-        
+
         # 只有当 cookie 值真的发生变化时才重启任务
-        if item.value != old_cookie_value:
+        if new_value != old_cookie_value:
             logger.info(f"Cookie值已变化，重启任务: {cid}")
-            cookie_manager.manager.update_cookie(cid, item.value, save_to_db=False)
+            cookie_manager.manager.update_cookie(cid, new_value, save_to_db=False)
         else:
             logger.info(f"Cookie值未变化，无需重启任务: {cid}")
         
@@ -2848,6 +2854,16 @@ async def _process_qr_login_session(
 async def process_qr_login_cookies(cookies: str, unb: str, current_user: Dict[str, Any]) -> Dict[str, Any]:
     """验证并快速保存扫码Cookie，不等待浏览器增强刷新。"""
     user_id = current_user['user_id']
+
+    # 拿到 x5sec 说明滑块验证已通过，此时必须清掉 x5secdata / x5sectag 这类
+    # 「挑战标记」，否则闲鱼仍按「验证未完成」处理（FAIL_SYS_USER_VALIDATE），
+    # 表现就是「滑块过了但账号还是用不了」。用户在自己浏览器过完滑块、再把
+    # Cookie 回填回来时最容易踩到 —— 浏览器里这两个字段是并存的。
+    # 没有 x5sec 时该函数原样返回（挑战标记还要留着定位惩罚页），所以无条件调用是安全的。
+    from utils.xianyu_utils import drop_stale_captcha_challenge
+
+    cookies = drop_stale_captcha_challenge(cookies)
+
     cookie_fields = trans_cookies(cookies)
     if not cookie_fields:
         raise ValueError("扫码Cookie为空")
