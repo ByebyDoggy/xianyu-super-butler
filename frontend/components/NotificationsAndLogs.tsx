@@ -83,6 +83,21 @@ const CHANNEL_DEFINITIONS: Record<NotificationChannelType, ChannelDefinition> = 
     ],
     defaults: { server_url: 'https://api.day.app' },
   },
+  serverchan: {
+    label: 'Server酱',
+    fields: [
+      { key: 'send_key', label: 'SendKey', type: 'password', placeholder: 'SCTxxxxxxxxxxxxxxxx' },
+      {
+        key: 'base_url',
+        label: '接口地址',
+        placeholder: 'https://sctapi.ftqq.com',
+        optional: true,
+      },
+      { key: 'title', label: '消息标题', placeholder: '闲鱼通知', optional: true },
+    ],
+    // Server酱·Turbo 的默认域名；Server酱³ 请改成 https://<uid>.push.ft07.com/send
+    defaults: { base_url: 'https://sctapi.ftqq.com', title: '闲鱼通知' },
+  },
   email: {
     label: '邮件',
     fields: [

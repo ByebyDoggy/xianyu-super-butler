@@ -4857,6 +4857,8 @@ class XianyuLive:
                         await self._send_wechat_notification(config_data, message)
                     case 'telegram':
                         await self._send_telegram_notification(config_data, message)
+                    case 'serverchan':
+                        await self._send_serverchan_notification(config_data, message)
                     case _:
                         logger.warning(f"📱 不支持的通知渠道类型: {channel_type}")
                         continue
@@ -4970,6 +4972,9 @@ class XianyuLive:
                         case 'telegram':
                             logger.info(f"📱 开始发送Telegram通知...")
                             await self._send_telegram_notification(config_data, notification_msg)
+                        case 'serverchan':
+                            logger.info(f"📱 开始发送Server酱通知...")
+                            await self._send_serverchan_notification(config_data, notification_msg)
                         case _:
                             logger.warning(f"📱 不支持的通知渠道类型: {channel_type}")
 
@@ -5436,6 +5441,77 @@ class XianyuLive:
         except Exception as e:
             logger.error(f"发送Telegram通知异常: {self._safe_str(e)}")
 
+    async def _send_serverchan_notification(self, config_data: dict, message: str):
+        """发送 Server 酱（ServerChan）通知。
+
+        兼容两代接口，靠 base_url 区分（都是 title + desp 两个表单字段）：
+        - Server酱·Turbo: POST https://sctapi.ftqq.com/<SENDKEY>.send
+        - Server酱³:      POST https://<uid>.push.ft07.com/send/<SENDKEY>.send
+        把 base_url 填对即可，所以默认值是 Turbo 的域名。
+        """
+        try:
+            import aiohttp
+
+            logger.info("📮 Server酱通知 - 开始处理")
+
+            base_url = (config_data.get('base_url') or 'https://sctapi.ftqq.com').strip()
+            send_key = (config_data.get('send_key') or '').strip()
+            title = (config_data.get('title') or '闲鱼通知').strip()
+            channel = str(config_data.get('channel') or '').strip()  # Server酱³ 通道号，可空
+            tags = str(config_data.get('tags') or '').strip()        # Server酱³ 标签，可空
+
+            if not send_key:
+                logger.warning("📮 Server酱通知 - send_key 未配置，无法发送通知")
+                return
+
+            api_url = f"{base_url.rstrip('/')}/{send_key}.send"
+            payload = {'title': title, 'desp': message}
+            if channel:
+                payload['channel'] = channel
+            if tags:
+                payload['tags'] = tags
+
+            logger.info(f"📮 Server酱通知 - 发送到 {base_url}（SendKey 已配置）")
+
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    api_url, data=payload,
+                    timeout=aiohttp.ClientTimeout(total=15),
+                ) as response:
+                    body = await response.text()
+
+                    if response.status != 200:
+                        logger.warning(
+                            f"📮 Server酱通知发送失败: HTTP {response.status} - {body[:200]}"
+                        )
+                        return
+
+                    # Server 酱成功/失败都可能返回 200，必须看响应体里的 code。
+                    # Turbo:    {"code":0,"message":"","data":{...}}
+                    # Server酱³: {"code":0,"message":"","data":{"error":"SUCCESS",...}}
+                    import json as _json
+
+                    try:
+                        result = _json.loads(body)
+                    except Exception:
+                        logger.warning(
+                            f"📮 Server酱通知响应不是 JSON，无法确认是否成功: {body[:200]}"
+                        )
+                        return
+
+                    code = result.get('code')
+                    if code in (0, None):
+                        logger.info("📮 Server酱通知发送成功")
+                    else:
+                        logger.warning(
+                            f"📮 Server酱通知发送失败: code={code}, "
+                            f"message={result.get('message')}, "
+                            f"detail={str(result.get('data') or result.get('info'))[:200]}"
+                        )
+
+        except Exception as e:
+            logger.error(f"发送Server酱通知异常: {self._safe_str(e)}")
+
     def _is_verification_notification(self, notification_type: str) -> bool:
         """是否是需要“尽快提醒用户”的验证类通知（用短冷却）。"""
         return (notification_type or '').startswith((
@@ -5557,6 +5633,9 @@ class XianyuLive:
                             notification_sent = True
                         case 'telegram':
                             await self._send_telegram_notification(config_data, notification_msg)
+                            notification_sent = True
+                        case 'serverchan':
+                            await self._send_serverchan_notification(config_data, notification_msg)
                             notification_sent = True
                         case _:
                             logger.warning(f"不支持的通知渠道类型: {channel_type}")
@@ -5705,6 +5784,9 @@ class XianyuLive:
                             case 'telegram':
                                 await self._send_telegram_notification(config_data, notification_message)
                                 logger.info(f"已发送自动发货通知到Telegram")
+                            case 'serverchan':
+                                await self._send_serverchan_notification(config_data, notification_message)
+                                logger.info(f"已发送自动发货通知到Server酱")
                             case 'bark':
                                 await self._send_bark_notification(config_data, notification_message)
                                 logger.info(f"已发送自动发货通知到Bark")

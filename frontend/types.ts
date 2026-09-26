@@ -338,6 +338,7 @@ export type NotificationChannelType =
   | 'dingtalk'
   | 'feishu'
   | 'bark'
+  | 'serverchan'
   | 'email'
   | 'webhook'
   | 'wechat'

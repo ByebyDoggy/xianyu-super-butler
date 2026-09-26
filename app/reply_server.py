@@ -1664,10 +1664,13 @@ NOTIFICATION_CHANNEL_REQUIRED_FIELDS = {
     "webhook": ("webhook_url",),
     "wechat": ("webhook_url",),
     "telegram": ("bot_token", "chat_id"),
+    "serverchan": ("send_key",),
 }
 NOTIFICATION_CHANNEL_TYPE_ALIASES = {
     "ding_talk": "dingtalk",
     "lark": "feishu",
+    "server_chan": "serverchan",
+    "sct": "serverchan",
 }
 
 

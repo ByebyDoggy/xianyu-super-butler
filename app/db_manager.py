@@ -627,7 +627,10 @@ class DBManager:
             CREATE TABLE IF NOT EXISTS notification_channels (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT NOT NULL,
-                type TEXT NOT NULL CHECK (type IN ('qq','ding_talk','dingtalk','feishu','lark','bark','email','webhook','wechat','telegram')),
+                -- type 上不写 CHECK：渠道类型还在陆续增加（serverchan 等），
+                -- 而 SQLite 改不了 CHECK，加一种就得整表重建。类型合法性由
+                -- reply_server.validate_notification_channel 把关。
+                type TEXT NOT NULL,
                 config TEXT NOT NULL,
                 enabled BOOLEAN DEFAULT TRUE,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -1006,6 +1009,19 @@ class DBManager:
                 self.upgrade_item_multi_quantity_default(cursor)
                 self.set_system_setting("db_version", "1.6", "数据库版本号")
                 logger.info("数据库升级到版本1.6完成")
+
+            # 升级到版本1.7 - 多数量订单默认按实际购买件数发货
+            if current_version < "1.7":
+                logger.info("开始升级数据库到版本1.7...")
+                self.set_system_setting("db_version", "1.7", "数据库版本号")
+                logger.info("数据库升级到版本1.7完成")
+
+            # 升级到版本1.8 - 通知渠道支持 Server酱，并去掉 type 的 CHECK 约束
+            if current_version < "1.8":
+                logger.info("开始升级数据库到版本1.8...")
+                self.upgrade_notification_channels_drop_type_check(cursor)
+                self.set_system_setting("db_version", "1.8", "数据库版本号")
+                logger.info("数据库升级到版本1.8完成")
 
             # 迁移遗留数据（在所有版本升级完成后执行）
             self.migrate_legacy_data(cursor)
@@ -1425,7 +1441,8 @@ class DBManager:
                         'email': 'qq',  # 暂时映射为qq，后续版本会支持
                         'webhook': 'qq',  # 暂时映射为qq，后续版本会支持
                         'wechat': 'qq',  # 暂时映射为qq，后续版本会支持
-                        'telegram': 'qq'  # 暂时映射为qq，后续版本会支持
+                        'telegram': 'qq',  # 暂时映射为qq，后续版本会支持
+                        'serverchan': 'qq'  # 该版本的 CHECK 还没有 serverchan，先落到 qq
                     }
 
                     new_type = type_mapping.get(old_type, 'qq')  # 默认转换为qq类型
@@ -1461,6 +1478,75 @@ class DBManager:
             logger.error(f"升级notification_channels表失败: {e}")
             raise
 
+    def upgrade_notification_channels_drop_type_check(self, cursor):
+        """重建 notification_channels，去掉 type 上的 CHECK 约束。
+
+        原建表语句把渠道类型写死在 CHECK 里（qq/dingtalk/feishu/bark/email/
+        webhook/wechat/telegram），而 SQLite 不支持修改 CHECK —— 新增一种渠道
+        （例如 Server酱）就必须整表重建。这里借增加 serverchan 的机会把 CHECK
+        去掉，以后再加渠道就不用写迁移了；类型合法性由
+        reply_server.validate_notification_channel 把关。
+
+        幂等：表上没有 CHECK 约束就直接跳过。
+        """
+        try:
+            cursor.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='notification_channels'"
+            )
+            row = cursor.fetchone()
+            if not row:
+                logger.info("notification_channels 表不存在，无需升级")
+                return True
+
+            table_sql = row[0] or ''
+            if 'check' not in table_sql.lower():
+                logger.info("notification_channels 已无 type CHECK 约束，跳过升级")
+                return True
+
+            cursor.execute("PRAGMA table_info(notification_channels)")
+            columns = [item[1] for item in cursor.fetchall()]
+            if not columns:
+                logger.info("notification_channels 无字段信息，跳过升级")
+                return True
+
+            # 老库可能没有 user_id（v1.1 之前），按实际字段重建，别硬塞 NOT NULL
+            has_user_id = 'user_id' in columns
+            user_column = 'user_id INTEGER NOT NULL,' if has_user_id else ''
+            column_list = (
+                ['id', 'name']
+                + (['user_id'] if has_user_id else [])
+                + ['type', 'config', 'enabled', 'created_at', 'updated_at']
+            )
+            quoted = ', '.join(column_list)
+
+            backup_name = 'notification_channels_check_bak'
+            cursor.execute(f"DROP TABLE IF EXISTS {backup_name}")
+            cursor.execute(f"ALTER TABLE notification_channels RENAME TO {backup_name}")
+            cursor.execute(f'''
+            CREATE TABLE notification_channels (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                {user_column}
+                type TEXT NOT NULL,
+                config TEXT NOT NULL,
+                enabled BOOLEAN DEFAULT TRUE,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            ''')
+            cursor.execute(
+                f"INSERT INTO notification_channels ({quoted}) "
+                f"SELECT {quoted} FROM {backup_name}"
+            )
+            cursor.execute(f"DROP TABLE {backup_name}")
+            logger.info(
+                "notification_channels 重建完成：去掉 type CHECK 约束（现已支持 serverchan）"
+            )
+            return True
+        except Exception as e:
+            logger.error(f"重建 notification_channels 失败: {e}")
+            raise
+
     def upgrade_notification_channels_types(self, cursor):
         """升级notification_channels表支持更多渠道类型"""
         try:
@@ -1489,7 +1575,7 @@ class DBManager:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT NOT NULL,
                 user_id INTEGER NOT NULL,
-                type TEXT NOT NULL CHECK (type IN ('qq','ding_talk','dingtalk','feishu','lark','bark','email','webhook','wechat','telegram')),
+                type TEXT NOT NULL,
                 config TEXT NOT NULL,
                 enabled BOOLEAN DEFAULT TRUE,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -1515,7 +1601,10 @@ class DBManager:
                         'email': 'email',        # 邮件通知
                         'webhook': 'webhook',    # Webhook通知
                         'wechat': 'wechat',      # 微信通知
-                        'telegram': 'telegram'   # Telegram通知
+                        'telegram': 'telegram',  # Telegram通知
+                        'serverchan': 'serverchan',  # Server酱通知
+                        'server_chan': 'serverchan',
+                        'sct': 'serverchan'
                     }
 
                     new_type = type_mapping.get(old_type, 'qq')  # 默认为qq
@@ -1555,6 +1644,7 @@ class DBManager:
             logger.info("   - webhook (Webhook通知)")
             logger.info("   - wechat (微信通知)")
             logger.info("   - telegram (Telegram通知)")
+            logger.info("   - serverchan (Server酱通知)")
             return True
         except Exception as e:
             logger.error(f"升级notification_channels表类型失败: {e}")
@@ -1671,10 +1761,13 @@ class DBManager:
             'webhook': 'webhook',
             'wechat': 'wechat',
             'telegram': 'telegram',
+            'serverchan': 'serverchan',
             # 处理一些可能的变体
             'dingding': 'dingtalk',
             'weixin': 'wechat',
-            'tg': 'telegram'
+            'tg': 'telegram',
+            'server_chan': 'serverchan',
+            'sct': 'serverchan'
         }
         return type_mapping.get(old_type.lower(), 'qq')
     
