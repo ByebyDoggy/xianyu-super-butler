@@ -107,6 +107,22 @@ export const addAccountByCookie = async (cookie: string): Promise<{
   return post('/cookie-login', { cookie });
 };
 
+// 用本地有头浏览器登录闲鱼：弹出的窗口里完成扫码/账号密码/滑块/人脸，
+// 成功后自动回收 Cookie 并保存。这类交互可能要好几分钟，所以超时给足。
+export const browserLogin = async (data: {
+  cookie_id?: string;
+  timeout?: number;
+  url?: string;
+}): Promise<{
+  success: boolean;
+  account_id?: string;
+  is_new_account?: boolean;
+  unb?: string;
+  message?: string;
+}> => {
+  return post('/api/browser-login', data, { timeout: 30 * 60 * 1000 });
+};
+
 export const updateAccountStatus = async (id: string, enabled: boolean): Promise<any> => {
   return put(`/cookies/${id}/status`, { enabled });
 };

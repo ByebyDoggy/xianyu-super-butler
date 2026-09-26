@@ -3170,6 +3170,108 @@ async def login_with_pasted_cookie(
         return {'success': False, 'message': f'保存失败：{e}'}
 
 
+@app.post('/api/browser-login')
+async def browser_login_with_local_browser(
+    request: Dict[str, Any],
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """用本地有头浏览器登录闲鱼（在弹出来的窗口里完成扫码/滑块/人脸），成功后保存 Cookie。
+
+    为什么需要它：纯接口扫码链路遇到风控（滑块/人脸）就走不完了 ——
+    那一步是在浏览器端 JS + iframe 里完成的，服务端接口不下发登录态。
+    用真实浏览器登录还能把这份 profile 留给后续流程共用（见 utils/browser_profile.py），
+    平台会认为“登录”和“过后验证”是同一台设备。
+
+    body: {cookie_id?: str, timeout?: int, url?: str}
+      cookie_id 为空 = 添加新账号（先用临时 profile，登录拿到 unb 后转为正式 profile）
+    """
+    from utils.browser_login import open_login_session
+    from utils.browser_profile import adopt_staging_profile
+
+    cookie_id = str(request.get('cookie_id') or '').strip()
+    if cookie_id:
+        user_cookies = db_manager.get_all_cookies(current_user['user_id'])
+        if cookie_id not in user_cookies:
+            raise HTTPException(status_code=403, detail='无权限操作该账号')
+
+    try:
+        timeout = int(request.get('timeout') or 300)
+    except (TypeError, ValueError):
+        timeout = 300
+
+    log_with_user(
+        'info',
+        f"开始本地浏览器登录（目标账号: {cookie_id or '新账号'}）",
+        current_user,
+    )
+
+    info = await open_login_session(
+        cookie_id=cookie_id or None,
+        timeout=timeout,
+        url=str(request.get('url') or '').strip() or None,
+    )
+
+    if not info.get('success'):
+        log_with_user('warning', f"本地浏览器登录未完成: {info.get('message')}", current_user)
+        return {'success': False, 'message': info.get('message') or '登录未完成'}
+
+    # 新账号：把临时 profile 转为该账号的正式 profile，后续过验证等流程继续用同一份上下文
+    if not cookie_id:
+        adopt_staging_profile(info['unb'])
+
+    try:
+        account_info = await process_qr_login_cookies(
+            info['cookies_str'], info['unb'], current_user
+        )
+    except Exception as exc:
+        log_with_user(
+            'error',
+            f"浏览器登录 Cookie 保存失败: {type(exc).__name__}: {exc}",
+            current_user,
+        )
+        return {'success': False, 'message': f'Cookie 保存失败：{exc}'}
+
+    manager_operation = account_info.pop('_manager_operation', None)
+    log_with_user(
+        'info',
+        f"浏览器登录成功: 账号={account_info.get('account_id')}, "
+        f"新账号={account_info.get('is_new_account')}",
+        current_user,
+    )
+
+    # 后台补资料 / 进一步增强 Cookie（不阻塞接口返回）
+    async def _background_enhance():
+        try:
+            await _enhance_qr_login_cookies(
+                session_id=f"browser-login:{account_info.get('account_id')}",
+                account_info=account_info,
+                cookies=info['cookies_str'],
+                current_user=dict(current_user),
+                manager_operation=manager_operation,
+            )
+        except Exception as exc:
+            log_with_user(
+                'warning',
+                f"浏览器登录后台增强失败: 账号={account_info.get('account_id')}, "
+                f"异常类型={type(exc).__name__}",
+                current_user,
+            )
+
+    asyncio.create_task(_background_enhance())
+
+    return {
+        'success': True,
+        'account_id': account_info.get('account_id'),
+        'is_new_account': account_info.get('is_new_account'),
+        'unb': info['unb'],
+        'message': (
+            f"账号已添加：{account_info.get('account_id')}"
+            if account_info.get('is_new_account')
+            else f"账号 Cookie 已更新：{account_info.get('account_id')}"
+        ),
+    }
+
+
 @app.post("/qr-login/refresh-cookies")
 async def refresh_cookies_from_qr_login(
     request: Dict[str, Any],

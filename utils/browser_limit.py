@@ -152,6 +152,70 @@ async def launch_browser(
     return LimitedBrowser(browser, semaphore, purpose)
 
 
+class LimitedContext:
+    """给持久化上下文（launch_persistent_context 的返回值）套一层槽位管理。
+
+    持久化模式下没有独立的 browser 对象，context 就是入口，所以不能再套
+    LimitedBrowser。close() 时归还槽位，其余属性透传。
+    """
+
+    def __init__(self, context: Any, semaphore: threading.Semaphore, purpose: str):
+        self._context = context
+        self._semaphore = semaphore
+        self._purpose = purpose
+        self._released = False
+        self._release_lock = threading.Lock()
+
+    def _release(self) -> None:
+        with self._release_lock:
+            if not self._released:
+                self._released = True
+                self._semaphore.release()
+
+    async def close(self, *args, **kwargs):
+        try:
+            return await self._context.close(*args, **kwargs)
+        finally:
+            self._release()
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._context, name)
+
+
+async def launch_persistent_context(
+    playwright: Any,
+    user_data_dir: str,
+    launch_options: Optional[Dict[str, Any]] = None,
+    purpose: str = '浏览器任务',
+) -> LimitedContext:
+    """取到槽位后启动持久化上下文；没有空位就等着。
+
+    持久化上下文是保留真实指纹的关键（系统 Chrome + 历史 profile），
+    所以登录、过验证、刷 Cookie 这些流程都要走这里，并且共用同一个
+    user_data_dir（见 utils/browser_profile.py）。
+
+    调用方必须在 finally 里 await close()，槽位随之归还。
+    """
+    semaphore = _get_semaphore()
+
+    acquired = await asyncio.to_thread(semaphore.acquire, True, _ACQUIRE_TIMEOUT)
+    if not acquired:
+        raise TimeoutError(
+            f"{purpose}: 等待浏览器空闲超过 {_ACQUIRE_TIMEOUT} 秒。"
+            "可能有浏览器任务卡住未退出，或机器性能不足以支撑当前账号数量。"
+        )
+
+    try:
+        context = await playwright.chromium.launch_persistent_context(
+            user_data_dir, **(launch_options or {})
+        )
+    except BaseException:
+        semaphore.release()
+        raise
+
+    return LimitedContext(context, semaphore, purpose)
+
+
 @contextmanager
 def browser_slot(purpose: str = '浏览器任务'):
     """同步版槽位。供滑块验证这类跑在线程里的同步 Playwright 使用。

@@ -8,6 +8,7 @@ import {
   generateQRLogin,
   checkQRLoginStatus,
   addAccountByCookie,
+  browserLogin,
   updateAccountRemark,
   updateAccountAutoConfirm,
   updateAccountPauseDuration,
@@ -22,7 +23,7 @@ import {
   requestFreshCaptchaUrl,
 } from '../services/api';
 import { confirmAction, notify } from '../services/feedback';
-import {Power, Edit2, Trash2, QrCode, X, Check, Loader2, MessageSquare, RefreshCw, Save, User, Clock, Key, Eye, EyeOff, Bot, Settings, MapPin, Users, ShieldCheck} from 'lucide-react';
+import {Power, Edit2, Trash2, QrCode, X, Check, Loader2, MessageSquare, RefreshCw, Save, User, Clock, Key, Eye, EyeOff, Bot, Settings, MapPin, Users, ShieldCheck, MonitorSmartphone} from 'lucide-react';
 import { EmptyState, PageHeader, PageLoading } from './ui';
 
 type ModalType = 'edit' | 'ai-settings' | null;
@@ -44,6 +45,8 @@ const AccountList: React.FC = () => {
   const [showCookieModal, setShowCookieModal] = useState(false);
   const [cookieInput, setCookieInput] = useState('');
   const [cookieSubmitting, setCookieSubmitting] = useState(false);
+  // 本地浏览器登录：值为账号 ID，或 'new' 表示“添加新账号”
+  const [browserLoginTarget, setBrowserLoginTarget] = useState<string | null>(null);
   const [qrCodeUrl, setQrCodeUrl] = useState<string>('');
   const [qrStatus, setQrStatus] = useState<string>('pending');
   const [qrMessage, setQrMessage] = useState<string>('');
@@ -556,6 +559,30 @@ const AccountList: React.FC = () => {
     }
   };
 
+  // 本地有头浏览器登录：弹出的真实浏览器窗口里完成扫码/账号密码/滑块/人脸，
+  // 登录成功后系统自动回收 Cookie。浏览器 profile 会被后续流程共用。
+  const handleBrowserLogin = async (accountId?: string) => {
+    setBrowserLoginTarget(accountId || 'new');
+    notify('已打开浏览器窗口，请在窗口里完成登录（扫码 / 账号密码 / 滑块 / 人脸都可以）', 'info');
+    try {
+      const res = await browserLogin(accountId ? { cookie_id: accountId } : {});
+      if (res.success) {
+        notify(res.message || '登录成功，账号已保存', 'success');
+        await loadAccounts();
+        const status = await getRiskControlStatus();
+        setRiskBlocked((status.accounts || []).filter(
+          item => item.blocked || (item.verification_type && item.verification_type !== 'none')
+        ));
+      } else {
+        notify(res.message || '登录未完成', 'error');
+      }
+    } catch (e) {
+      notify(e instanceof Error ? e.message : '浏览器登录失败', 'error');
+    } finally {
+      setBrowserLoginTarget(null);
+    }
+  };
+
   const getRuntimeBadge = (account: AccountDetail) => {
     if (!account.enabled) {
       return { label: '已暂停', className: 'bg-gray-100 text-gray-500' };
@@ -617,6 +644,17 @@ const AccountList: React.FC = () => {
         badge={<span className="status-badge status-badge-info">{accounts.length} 个账号</span>}
         actions={(
           <div className="flex items-center gap-2">
+            <button
+              onClick={() => handleBrowserLogin()}
+              disabled={browserLoginTarget !== null}
+              className="ios-btn-secondary flex items-center justify-center gap-2 rounded-md px-4 py-2 text-sm"
+              title="弹出一个真实浏览器窗口，在窗口里登录；这份 profile 会被后续过验证等流程共用"
+            >
+              {browserLoginTarget === 'new'
+                ? <Loader2 className="h-4 w-4 animate-spin" />
+                : <MonitorSmartphone className="h-4 w-4" />}
+              浏览器登录
+            </button>
             <button
               onClick={() => setShowCookieModal(true)}
               className="ios-btn-secondary flex items-center justify-center gap-2 rounded-md px-4 py-2 text-sm"
@@ -725,7 +763,8 @@ const AccountList: React.FC = () => {
                     <p className="mt-1">
                       推荐用你自己的浏览器过滑块（通过率远高于服务器自动拖动）。注意：
                       <b>通行凭证 x5sec 只会留在你自己的浏览器里</b>，服务器拿不到，
-                      所以过完滑块后还得把 Cookie 回填回来。分两步：
+                      所以过完滑块后还得把 Cookie 回填回来。<b>最省事的是用 ③</b>：
+                      弹出的浏览器窗口里过一次，系统会自动收下 Cookie 并保存。
                     </p>
                     <div className="mt-2 flex flex-wrap items-center gap-2">
                       <button
@@ -746,6 +785,18 @@ const AccountList: React.FC = () => {
                       >
                         <Key className="h-3.5 w-3.5" />
                         ② 回填 Cookie
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => handleBrowserLogin(account.id)}
+                        disabled={browserLoginTarget !== null}
+                        className="inline-flex items-center gap-1.5 rounded-full bg-white px-3 py-1.5 font-bold text-amber-900 ring-1 ring-amber-300 hover:bg-amber-100 disabled:opacity-60"
+                        title="弹出真实浏览器窗口，在里面过验证/重新登录，成功自动保存"
+                      >
+                        {browserLoginTarget === account.id
+                          ? <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                          : <MonitorSmartphone className="h-3.5 w-3.5" />}
+                        ③ 用本地浏览器重新登录
                       </button>
                     </div>
                     <p className="mt-1.5 text-[11px] text-amber-700">

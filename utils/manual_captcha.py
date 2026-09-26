@@ -17,7 +17,6 @@ import time
 from typing import Any, Dict, Optional
 
 from loguru import logger
-from utils import browser_limit
 from app.config import browser_headless
 
 LOGIN_URL = "https://www.goofish.com/"
@@ -185,28 +184,22 @@ async def open_manual_session(
     refresh_task = None
     try:
         playwright = await async_playwright().start()
-        browser = await browser_limit.launch_browser(
-            playwright,
-            {'headless': headless,
-             # 只用完整版 Chromium。headless=True 默认会去找单独下载的
-             # chromium_headless_shell，缺失时报 Executable doesn't exist，
-             # 人工验证页面就会卡在「正在服务器上打开验证页面」。
-             'channel': 'chromium',
-             'args': [
-                "--no-sandbox",
-                "--disable-setuid-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-blink-features=AutomationControlled",
-            ]},
-            "人工验证码",
+
+        # 与登录 / 滑块共用同一个持久化 profile：平台会把“登录”和“过验证”看成
+        # 同一台设备（指纹、访问历史、localStorage 全部连续），通过率明显高于
+        # 每次全新的一次性上下文。
+        from utils.browser_profile import (
+            clean_singleton_lock_files,
+            launch_shared_context,
+            profile_dir,
         )
-        context = await browser.new_context(
-            viewport={"width": 1280, "height": 800},
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/138.0.0.0 Safari/537.36"
-            ),
+
+        profile_path = profile_dir(cookie_id)
+        clean_singleton_lock_files(profile_path, label=cookie_id)
+
+        browser = None  # 持久化模式下没有独立 browser 句柄
+        context = await launch_shared_context(
+            playwright, profile_path, headless=headless, purpose='人工验证码'
         )
 
         if cookies_str:

@@ -108,6 +108,10 @@ RECONNECT = config.get('RECONNECT', {
     'auto': True,
     'interval': 0
 })
+BROWSER_LOGIN = config.get('BROWSER_LOGIN', {
+    'url': 'https://www.goofish.com/im',
+    'timeout': 300
+})
 BROWSER = config.get('BROWSER', {'headless': False})
 
 
