@@ -9,6 +9,7 @@ from typing import Dict, Optional, Tuple
 from playwright.async_api import async_playwright, Browser, BrowserContext, Page, Playwright
 from loguru import logger
 from utils import browser_limit
+from app.config import browser_headless
 from collections import defaultdict
 
 
@@ -49,7 +50,7 @@ class BrowserPool:
         self,
         cookie_id: str,
         cookie_string: str,
-        headless: bool = True,
+        headless: Optional[bool] = None,
         create_new_page: bool = True
     ) -> Optional[Tuple[Browser, BrowserContext, Page]]:
         """
@@ -58,12 +59,15 @@ class BrowserPool:
         Args:
             cookie_id: Cookie ID
             cookie_string: Cookie字符串
-            headless: 是否无头模式
+            headless: 是否无头模式。None 表示跟随全局配置（默认有头，见 app.config.browser_headless）。
             create_new_page: 是否创建新页面（默认True，避免并发冲突）
 
         Returns:
             (browser, context, page) 元组，失败返回None
         """
+        if headless is None:
+            headless = browser_headless()
+
         async with self._locks[cookie_id]:
             # 检查是否已存在该cookie_id的浏览器实例
             async with self._pool_lock:
@@ -119,7 +123,7 @@ class BrowserPool:
         self,
         cookie_id: str,
         cookie_string: str,
-        headless: bool = True
+        headless: Optional[bool] = None
     ) -> Optional[Tuple[Playwright, Browser, BrowserContext, Page]]:
         """
         创建新的浏览器实例
@@ -127,11 +131,14 @@ class BrowserPool:
         Args:
             cookie_id: Cookie ID
             cookie_string: Cookie字符串
-            headless: 是否无头模式
+            headless: 是否无头模式。None 表示跟随全局配置（默认有头）。
 
         Returns:
             (playwright, browser, context, page) 元组，失败返回None
         """
+        if headless is None:
+            headless = browser_headless()
+
         try:
             # 启动Playwright
             playwright = await async_playwright().start()

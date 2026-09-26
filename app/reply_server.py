@@ -23,6 +23,7 @@ from app.db_manager import db_manager
 from app.product_automation import ProductAutomationService
 from app.file_log_collector import setup_file_logging, get_file_log_collector
 from app.ai_reply_engine import ai_reply_engine
+from app.config import browser_headless
 from app.routers.delivery_block import create_delivery_block_router
 from utils.qr_login import qr_login_manager
 from utils.xianyu_utils import trans_cookies
@@ -2091,7 +2092,9 @@ async def _execute_password_login(session_id: str, account_id: str, account: str
         slider_instance = XianyuSliderStealth(
             user_id=account_id,
             enable_learning=True,
-            headless=not show_browser
+            # 默认有头（browser_headless() 默认 False）。
+            # 若调用方显式要求 show_browser，则无论配置如何都开有头窗口。
+            headless=browser_headless() and not show_browser
         )
         
         # 更新会话信息
@@ -3546,6 +3549,53 @@ def delete_notification_channel(channel_id: int, current_user: Dict[str, Any] = 
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post('/api/notify-test/{cookie_id}')
+async def send_test_notification(
+    cookie_id: str,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """向该账号已绑定的通知渠道发一条测试消息。
+
+    先确认渠道真能收到，否则等账号被风控要求验证时才发现收不到，
+    就只能靠翻日志。测试消息不走冷却，点了就发。
+    """
+    user_cookies = db_manager.get_all_cookies(current_user['user_id'])
+    if cookie_id not in user_cookies:
+        raise HTTPException(status_code=403, detail='无权限操作该账号')
+
+    notifications = db_manager.get_account_notifications(cookie_id)
+    if not notifications:
+        raise HTTPException(
+            status_code=409,
+            detail='该账号还没有绑定任何通知渠道，请先到「通知与日志」新建渠道并绑定账号',
+        )
+
+    manager = cookie_manager.manager
+    instance = manager.instances.get(cookie_id) if manager is not None else None
+    if instance is None:
+        raise HTTPException(
+            status_code=409,
+            detail='账号当前未运行，无法发送测试通知。请先启用该账号。',
+        )
+
+    # 测试消息必须真的发出去：清掉该类型的冷却记录
+    try:
+        instance.last_notification_time.pop('notification_test', None)
+    except Exception:
+        pass
+
+    await instance.send_token_refresh_notification(
+        f'这是一条测试通知：通知渠道配置正常。（账号 {cookie_id}）',
+        'notification_test',
+    )
+
+    return {
+        'success': True,
+        'channel_count': len(notifications),
+        'message': f'已向 {len(notifications)} 个渠道发送测试通知，请检查是否收到',
+    }
 
 
 # ------------------------- 消息通知配置接口 -------------------------
@@ -7764,7 +7814,7 @@ async def refresh_single_order(
             cookie_string=cookies_str,
             max_concurrent=1,
             timeout=30,
-            headless=True,
+            headless=browser_headless(),
             use_pool=True,
             force_refresh=True
         )
@@ -7886,7 +7936,7 @@ async def update_order(
                         cookie_id=cookie_id,
                         cookie_string=cookie_string,
                         timeout=30,
-                        headless=True,
+                        headless=browser_headless(),
                         use_pool=True  # 使用浏览器池
                     )
 
@@ -8086,7 +8136,7 @@ async def refresh_orders_status(
                 cookie_string=cookies_str,
                 max_concurrent=5,  # 并发5个
                 timeout=30,
-                headless=True,
+                headless=browser_headless(),
                 use_pool=True,  # 使用浏览器池
                 force_refresh=True  # 强制刷新，跳过缓存检查
             )

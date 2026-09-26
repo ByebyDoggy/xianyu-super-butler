@@ -17,7 +17,7 @@ from app.config import (
     WEBSOCKET_URL, HEARTBEAT_INTERVAL, HEARTBEAT_TIMEOUT,
     TOKEN_REFRESH_INTERVAL, TOKEN_RETRY_INTERVAL, COOKIES_STR,
     LOG_CONFIG, AUTO_REPLY, DEFAULT_HEADERS, WEBSOCKET_HEADERS,
-    APP_CONFIG, API_ENDPOINTS
+    APP_CONFIG, API_ENDPOINTS, SLIDER_VERIFICATION, browser_headless
 )
 from app.config import config as cfg  # 导入config实例（不是模块），使用别名避免冲突
 import sys
@@ -773,6 +773,19 @@ class XianyuLive:
         self.last_notification_time = {}  # 记录每种通知类型的最后发送时间
         self.notification_cooldown = 300  # 5分钟内不重复发送相同类型的通知
         self.token_refresh_notification_cooldown = 18000  # Token刷新异常通知冷却时间：3小时
+        # 验证类通知的冷却时间。验证是紧急事项——用户不处理账号就一直不可用，
+        # 沿用 3 小时的 Token 冷却会让人以为“通知功能没生效”。
+        self.verification_notification_cooldown = 600  # 10分钟
+
+        # 自动过滑块开关（global_config.yml → SLIDER_VERIFICATION.auto_solve）。
+        # 关掉后：检测到验证只发通知 + 转人工，不再自动拖滑块 —— 实测自动拖动
+        # 成功率仅约 10%，而且每次失败都会叠一层风控（熔断 1200 秒，连续命中只增不减），
+        # 最后把账号拖进“必须人工处理”。
+        self.auto_solve_slider = bool(SLIDER_VERIFICATION.get('auto_solve', True))
+        # 出现验证时是否通过已配置的渠道通知用户
+        self.notify_on_verification = bool(
+            SLIDER_VERIFICATION.get('notify_on_verification', True)
+        )
         self.notification_lock = asyncio.Lock()  # 通知防重复机制的异步锁
 
         # 自动发货防重复机制
@@ -2335,13 +2348,21 @@ class XianyuLive:
                                 # 重新尝试刷新token（递归调用，但有深度限制）
                                 return await self.refresh_token(captcha_retry_count + 1)
                             else:
-                                logger.error(f"【{self.cookie_id}】滑块验证失败")
+                                if self.auto_solve_slider:
+                                    logger.error(f"【{self.cookie_id}】滑块验证失败")
+                                else:
+                                    logger.warning(
+                                        f"【{self.cookie_id}】自动过滑块已停用，等待人工完成验证"
+                                    )
 
                                 # 自动验证失败后立即熔断。实测滑块虽被拖到目标位置，
                                 # 服务端仍判定失败（行为特征识别），继续自动重试不会成功，
                                 # 只会让风控持续更久 —— 此时应转人工处理。
+                                # 已停用自动过滑块时同理：在等人处理期间不该继续打接口。
                                 risk_control.registry.get(self.cookie_id).trip(
                                     "滑块自动验证失败，需人工处理"
+                                    if self.auto_solve_slider
+                                    else "检测到人机验证且自动过滑块已停用，等待人工处理"
                                 )
                                 # 本轮已经熔断过，后面基于 ret 的通用风控分支不要再记一次：
                                 # 同一次失败连续 trip 两次会让冷却阶梯跳级
@@ -2586,6 +2607,34 @@ class XianyuLive:
 
             logger.info(f"【{self.cookie_id}】验证URL: {verification_url}")
 
+            # 自动过滑块已停用：不再自动拖滑块，只通知 + 转人工。
+            # 实测自动拖动成功率仅约 10%，而且服务端查的是“合并前子事件密度”
+            # （自动化派发每帧只有一个事件），继续自动重试不会成功，
+            # 只会让风控持续更久（每失败一次熔断 1200 秒，连续命中次数只增不减）。
+            if not self.auto_solve_slider:
+                logger.warning(
+                    f"【{self.cookie_id}】检测到人机验证，但自动过滑块已停用"
+                    f"（SLIDER_VERIFICATION.auto_solve=false），转人工处理"
+                )
+                log_captcha_event(
+                    self.cookie_id, "自动过滑块已停用，需要人工验证", None,
+                    f"验证URL: {verification_url[:160]}"
+                )
+
+                if self.notify_on_verification:
+                    await self.send_token_refresh_notification(
+                        "账号被闲鱼要求完成人机验证（滑块），当前已停用自动过滑块，"
+                        "需要你手动处理。步骤：① 打开下面的验证链接，用真实鼠标拖动滑块；"
+                        "② 通过后回到系统「账号管理」→「粘贴 Cookie 添加」，"
+                        "把浏览器的 Cookie 整段粘回（要含 x5sec）。",
+                        "captcha_manual_required",
+                        verification_url=verification_url,
+                    )
+                else:
+                    logger.info(f"【{self.cookie_id}】notify_on_verification 已关闭，跳过验证通知")
+
+                return None
+
             # 使用滑块验证器（独立实例，解决并发冲突）
             try:
                 # 使用集成的滑块验证方法（无需猴子补丁）
@@ -2599,7 +2648,9 @@ class XianyuLive:
                 # 屏幕参数与有头差异巨大，会被阿里 nc 直接识破。
                 # 服务器无显示器时用 Xvfb 提供虚拟显示：
                 #   xvfb-run -a --server-args="-screen 0 1920x1080x24" python Start.py
-                slider_headless = os.getenv('SLIDER_HEADLESS', 'false').lower() == 'true'
+                # 统一走 app.config.browser_headless()：默认有头。
+                # 理由见 global_config.yml → BROWSER.headless 的注释。
+                slider_headless = browser_headless()
                 slider_stealth = XianyuSliderStealth(
                     user_id=f"{self.cookie_id}",
                     enable_learning=True,  # 启用学习功能
@@ -5385,6 +5436,14 @@ class XianyuLive:
         except Exception as e:
             logger.error(f"发送Telegram通知异常: {self._safe_str(e)}")
 
+    def _is_verification_notification(self, notification_type: str) -> bool:
+        """是否是需要“尽快提醒用户”的验证类通知（用短冷却）。"""
+        return (notification_type or '').startswith((
+            'captcha_manual_required',
+            'captcha_verification_required',
+            'face_verification',
+        ))
+
     async def send_token_refresh_notification(self, error_message: str, notification_type: str = "token_refresh", chat_id: str = None, attachment_path: str = None, verification_url: str = None):
         """发送Token刷新异常通知（带防重复机制，支持附件）
         
@@ -5406,7 +5465,11 @@ class XianyuLive:
 
             # 为Token刷新异常通知使用特殊的3小时冷却时间
             # 基于错误消息内容判断是否为Token相关异常
-            if self._is_token_related_error(error_message):
+            if self._is_verification_notification(notification_type):
+                # 验证类：必须尽快让用户看到，否则账号一直不可用
+                cooldown_time = self.verification_notification_cooldown
+                cooldown_desc = f"{self.verification_notification_cooldown // 60}分钟"
+            elif self._is_token_related_error(error_message):
                 cooldown_time = self.token_refresh_notification_cooldown
                 cooldown_desc = "3小时"
             else:
@@ -5506,7 +5569,10 @@ class XianyuLive:
                 self.last_notification_time[notification_type] = current_time
 
                 # 根据错误消息内容使用不同的冷却时间
-                if self._is_token_related_error(error_message):
+                if self._is_verification_notification(notification_type):
+                    next_send_time = current_time + self.verification_notification_cooldown
+                    cooldown_desc = f"{self.verification_notification_cooldown // 60}分钟"
+                elif self._is_token_related_error(error_message):
                     next_send_time = current_time + self.token_refresh_notification_cooldown
                     cooldown_desc = "3小时"
                 else:

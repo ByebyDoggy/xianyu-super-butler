@@ -64,9 +64,23 @@ MANUAL_MODE:
 MESSAGE_EXPIRE_TIME: 300000
 TOKEN_REFRESH_INTERVAL: 3600  # 从3600秒(1小时)增加到72000秒(20小时)
 TOKEN_RETRY_INTERVAL: 600    # 从300秒(5分钟)增加到7200秒(2小时)
+BROWSER:
+  # 始终使用有头浏览器。无头 Chrome 的 WebGL 渲染器、字体列表、navigator.plugins、
+  # 屏幕参数与有头差异巨大，会被阿里 nc 直接识破 —— 同一账号、同一轨迹下实测：
+  # 无头 0/2 通过，有头 1/3 通过且平台确认解除风控。
+  # 无显示器的服务器（Docker/VPS）可用 Xvfb 提供虚拟显示，
+  # 或临时设环境变量 BROWSER_HEADLESS=true 退回无头。
+  headless: false
 SLIDER_VERIFICATION:
   max_concurrent: 1  # 滑块验证最大并发数。浏览器很吃 CPU，并发拉起会互相拖慢并降低通过率
   wait_timeout: 60   # 等待排队超时时间（秒）
+  # 自动过滑块开关。实测自动拖动成功率仅约 10%，而且每一次失败都会叠一层平台风控
+  # （熔断 1200 秒，连续命中次数只增不减），最终把账号拖进「必须人工处理」。
+  # 关掉后：检测到验证就按下面 notify_on_verification 发通知，并转人工处理，
+  # 不再自动拖滑块消耗风控额度。
+  auto_solve: false
+  # 出现验证（滑块/人脸）时，是否通过「通知与日志」里已配置的渠道提醒你
+  notify_on_verification: true
 WEBSOCKET_HEADERS:
   Accept-Encoding: gzip, deflate, br, zstd
   Accept-Language: zh-CN,zh;q=0.9

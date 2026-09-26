@@ -104,6 +104,25 @@ SLIDER_VERIFICATION = config.get('SLIDER_VERIFICATION', {
     'max_concurrent': 3,
     'wait_timeout': 60
 })
+BROWSER = config.get('BROWSER', {'headless': False})
+
+
+def browser_headless() -> bool:
+    """是否使用无头浏览器。
+
+    默认 False（有头）：无头 Chrome 的 WebGL 渲染器、字体列表、navigator.plugins、
+    屏幕参数与有头差异巨大，会被阿里 nc 直接识破 —— 同一账号、同一轨迹下实测
+    无头 0/2 通过，有头 1/3 通过且平台确认解除风控。
+
+    无显示器的服务器（Docker/VPS）可设 BROWSER_HEADLESS=true 退回无头
+    （配合 Xvfb 更好）；旧变量名 SLIDER_HEADLESS 仍然兼容。
+    """
+    env = os.getenv('BROWSER_HEADLESS')
+    if env is None:
+        env = os.getenv('SLIDER_HEADLESS')
+    if env is not None:
+        return env.strip().lower() in ('1', 'true', 'yes', 'on')
+    return bool(BROWSER.get('headless', False))
 API_ENDPOINTS = config.get('API_ENDPOINTS', {})
 DEFAULT_HEADERS = config.get('DEFAULT_HEADERS', {})
 WEBSOCKET_HEADERS = config.get('WEBSOCKET_HEADERS', {})

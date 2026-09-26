@@ -18,6 +18,7 @@ from typing import Any, Dict, Optional
 
 from loguru import logger
 from utils import browser_limit
+from app.config import browser_headless
 
 LOGIN_URL = "https://www.goofish.com/"
 
@@ -148,13 +149,16 @@ async def open_manual_session(
     cookie_id: str,
     cookies_str: str,
     timeout: int = DEFAULT_TIMEOUT,
-    headless: bool = True,
+    headless: Optional[bool] = None,
 ) -> Dict[str, Any]:
     """打开一个人工验证会话，等待人在浏览器里完成滑块。
 
     Args:
         timeout: 等待人工操作的秒数，超时后放弃并关闭浏览器。
-        headless: 默认无头 —— 页面通过远程通道推给用户，不需要本地窗口。
+        headless: 是否无头。None 表示跟随全局配置（默认有头）。
+            无头虽然可以靠远程通道把页面推给用户，但无头 Chrome 的指纹
+            很容易被 nc 识破，人工验证本来就要求“像真人”，所以默认有头；
+            无显示器的服务器可设 BROWSER_HEADLESS=true 退回无头。
 
     Returns:
         ``{"success": bool, "cookies_str": str, "message": str, "session_id": str}``。
@@ -163,6 +167,9 @@ async def open_manual_session(
     from playwright.async_api import async_playwright
 
     from utils.captcha_remote_control import captcha_controller
+
+    if headless is None:
+        headless = browser_headless()
 
     session_id = str(cookie_id)
     result: Dict[str, Any] = {
