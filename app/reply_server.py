@@ -5894,10 +5894,14 @@ class ItemSearchRequest(BaseModel):
     keyword: str
     page: int = 1
     page_size: int = 20
+    # 用哪个闲鱼账号搜。多账号部署应当传：它同时决定浏览器 profile 与 Cookie。
+    # 不传时只在当前后台用户的账号里挑第一个有效的。
+    cookie_id: Optional[str] = None
 
 class ItemSearchMultipleRequest(BaseModel):
     keyword: str
     total_pages: int = 1
+    cookie_id: Optional[str] = None
 
 @app.post("/items/search")
 async def search_items(
@@ -5912,11 +5916,20 @@ async def search_items(
 
         from utils.item_search import search_xianyu_items
 
+        # 校验搜索用的账号归属，避免拿到别人的账号
+        search_cookie_id = (search_request.cookie_id or '').strip() or None
+        if search_cookie_id and current_user:
+            owned = db_manager.get_all_cookies(current_user['user_id'])
+            if search_cookie_id not in owned:
+                raise HTTPException(status_code=403, detail='无权限使用该账号搜索')
+
         # 执行搜索
         result = await search_xianyu_items(
             keyword=search_request.keyword,
             page=search_request.page,
-            page_size=search_request.page_size
+            page_size=search_request.page_size,
+            cookie_id=search_cookie_id,
+            user_id=current_user.get('user_id') if current_user else None,
         )
 
         # 检查是否有错误
@@ -6010,10 +6023,18 @@ async def search_multiple_pages(
 
         from utils.item_search import search_multiple_pages_xianyu
 
+        search_cookie_id = (search_request.cookie_id or '').strip() or None
+        if search_cookie_id and current_user:
+            owned = db_manager.get_all_cookies(current_user['user_id'])
+            if search_cookie_id not in owned:
+                raise HTTPException(status_code=403, detail='无权限使用该账号搜索')
+
         # 执行多页搜索
         result = await search_multiple_pages_xianyu(
             keyword=search_request.keyword,
-            total_pages=search_request.total_pages
+            total_pages=search_request.total_pages,
+            cookie_id=search_cookie_id,
+            user_id=current_user.get('user_id') if current_user else None,
         )
 
         # 检查是否有错误

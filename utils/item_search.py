@@ -41,12 +41,24 @@ except ImportError:
 class XianyuSearcher:
     """闲鱼商品搜索器 - 基于 Playwright"""
 
-    def __init__(self):
+    def __init__(self, cookie_id: str = None, user_id: int = None):
+        """
+        Args:
+            cookie_id: 指定用哪个闲鱼账号搜索。**多账号部署必须传** ——
+                它同时决定两件事：
+                1) 用哪个持久化 profile（每个账号一份，见 utils/browser_profile.py）；
+                2) 注入哪个账号的 Cookie。
+                不传时只能退回历史上“全局共享目录 + 取第一个有效 Cookie”的行为，
+                多账号下会串账号，所以会打一条警告。
+            user_id: 后台用户 ID。没传 cookie_id 时用它把候选 Cookie 限定在本用户的账号内，
+                避免跨用户拿到别人的账号。
+        """
         self.browser = None
         self.context = None
         self.page = None
         self.api_responses = []
-        self.user_id = "default"  # 默认用户ID
+        self.cookie_id = cookie_id
+        self.user_id = user_id if user_id is not None else "default"  # 默认用户ID
         # 是否已占用浏览器槽位，避免重复获取或漏还
         self._browser_slot_held = False
 
@@ -632,13 +644,37 @@ class XianyuSearcher:
         return data
 
     async def get_first_valid_cookie(self):
-        """获取第一个有效的cookie"""
+        """获取用于搜索的 cookie。
+
+        多账号下必须“用哪个账号搜索就用哪个账号的 cookie”：
+        - 指定了 cookie_id → 只取该账号；
+        - 只给了 user_id   → 在该用户的账号里挑第一个有效的；
+        - 两者都没有       → 只能全局挑（历史行为），会打警告。
+        原实现无条件调 get_all_cookies() 取第一条，多账号/多用户部署下
+        会拿到别人的账号去搜索。
+        """
         try:
             from app.db_manager import db_manager
 
-            # 获取所有cookies，返回格式是 {id: value}
-            cookies = db_manager.get_all_cookies()
+            if self.cookie_id:
+                info = db_manager.get_cookie_by_id(self.cookie_id)
+                value = (info or {}).get('value') or ''
+                if len(value) > 50:
+                    logger.info(f"使用指定账号的 cookie 搜索: {self.cookie_id}")
+                    return {'id': self.cookie_id, 'value': value}
+                logger.warning(f"指定账号 {self.cookie_id} 的 cookie 不可用，无法搜索")
+                return None
 
+            if isinstance(self.user_id, int):
+                cookies = db_manager.get_all_cookies(self.user_id)
+            else:
+                logger.warning(
+                    "商品搜索未指定 cookie_id/user_id，只能全局挑第一个有效 cookie；"
+                    "多账号部署下可能串账号"
+                )
+                cookies = db_manager.get_all_cookies()
+
+            # 获取所有cookies，返回格式是 {id: value}
             # 找到第一个有效的cookie（长度大于50的认为是有效的）
             for cookie_id, cookie_value in cookies.items():
                 if len(cookie_value) > 50:
@@ -697,8 +733,20 @@ class XianyuSearcher:
             playwright = await async_playwright().start()
             
             # 设置持久化数据目录（保存缓存、cookies等）
-            import tempfile
-            user_data_dir = os.path.join(tempfile.gettempdir(), 'xianyu_browser_cache')
+            # 多账号必须分开：共用同一个 profile 会让两个账号共享 localStorage、
+            # 缓存和滑块验证状态，上一个账号残留的 Cookie 还会被下一个账号带上。
+            if self.cookie_id:
+                from utils.browser_profile import profile_dir
+
+                user_data_dir = profile_dir(self.cookie_id)
+            else:
+                import tempfile
+
+                user_data_dir = os.path.join(tempfile.gettempdir(), 'xianyu_browser_cache')
+                logger.warning(
+                    "商品搜索未指定 cookie_id，使用全局共享的浏览器目录（多账号会串）："
+                    f"{user_data_dir}"
+                )
             os.makedirs(user_data_dir, exist_ok=True)
             logger.info(f"使用持久化数据目录（保留缓存）: {user_data_dir}")
             
@@ -1521,7 +1569,8 @@ class XianyuSearcher:
 
 # 搜索器工具函数
 
-async def search_xianyu_items(keyword: str, page: int = 1, page_size: int = 20) -> Dict[str, Any]:
+async def search_xianyu_items(keyword: str, page: int = 1, page_size: int = 20,
+                              cookie_id: str = None, user_id: int = None) -> Dict[str, Any]:
     """
     搜索闲鱼商品的便捷函数，带重试机制
 
@@ -1540,7 +1589,7 @@ async def search_xianyu_items(keyword: str, page: int = 1, page_size: int = 20) 
         searcher = None
         try:
             # 每次搜索都创建新的搜索器实例，避免浏览器状态混乱
-            searcher = XianyuSearcher()
+            searcher = XianyuSearcher(cookie_id=cookie_id, user_id=user_id)
 
             logger.info(f"开始单页搜索，尝试次数: {attempt + 1}/{max_retries + 1}")
             result = await searcher.search_items(keyword, page, page_size)
@@ -1582,7 +1631,8 @@ async def search_xianyu_items(keyword: str, page: int = 1, page_size: int = 20) 
     }
 
 
-async def search_multiple_pages_xianyu(keyword: str, total_pages: int = 1) -> Dict[str, Any]:
+async def search_multiple_pages_xianyu(keyword: str, total_pages: int = 1,
+                                       cookie_id: str = None, user_id: int = None) -> Dict[str, Any]:
     """
     搜索多页闲鱼商品的便捷函数，带重试机制
 
@@ -1600,7 +1650,7 @@ async def search_multiple_pages_xianyu(keyword: str, total_pages: int = 1) -> Di
         searcher = None
         try:
             # 每次搜索都创建新的搜索器实例，避免浏览器状态混乱
-            searcher = XianyuSearcher()
+            searcher = XianyuSearcher(cookie_id=cookie_id, user_id=user_id)
 
             logger.info(f"开始多页搜索，尝试次数: {attempt + 1}/{max_retries + 1}")
             result = await searcher.search_multiple_pages(keyword, total_pages)
