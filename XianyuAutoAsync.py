@@ -6458,8 +6458,15 @@ class XianyuLive:
                         delivery_content = None
 
                 if delivery_content:
-                    # 处理备注信息和变量替换
-                    final_content = self._process_delivery_content_with_description(delivery_content, rule.get('card_description', ''))
+                    # 处理备注（发货语）与变量替换
+                    final_content = self._process_delivery_content_with_description(
+                        delivery_content,
+                        rule.get('card_description', ''),
+                        card_name=rule.get('card_name') or '',
+                        item_title=item_title or '',
+                        buyer_id=send_user_id or '',
+                        order_id=order_id or '',
+                    )
 
                     # 增加对应规则或商品规格绑定的发货次数统计。
                     if rule.get("rule_kind") == "variant_binding":
@@ -6484,26 +6491,62 @@ class XianyuLive:
 
 
 
-    def _process_delivery_content_with_description(self, delivery_content: str, card_description: str) -> str:
-        """处理发货内容和备注信息，实现变量替换"""
+    def _process_delivery_content_with_description(
+        self,
+        delivery_content: str,
+        card_description: str,
+        card_name: str = '',
+        item_title: str = '',
+        buyer_id: str = '',
+        order_id: str = '',
+    ) -> str:
+        """处理发货内容和备注信息，实现变量替换。
+
+        卡密的「备注」就是发货语模板（界面上叫「备注信息」）。规则：
+
+        - 备注里出现卡密变量 → **整段备注作为文案**，变量处替换成真实卡密。
+          例：备注写 `您好，你的卡密是{key} 请注意查收`
+              →  发出 `您好，你的卡密是XXXX-XXXX 请注意查收`
+        - 备注里没有卡密变量 → 备注在前、卡密在后（保留原有行为）。
+
+        变量名：{DELIVERY_CONTENT} 是历史字段名，同时接受 {key} / {KEY} / {content}
+        这些更顺手的写法 —— 用户很自然会写 {key}，写错了会被当成普通文字原样发出去。
+        另外支持 {card_name} / {item_title} / {buyer_id} / {order_id}。
+
+        图片卡（__IMAGE_SEND__）不参与替换：图片发不出文字。
+        """
         try:
             # 如果是图片发送标记，不进行备注处理，直接返回
             if delivery_content.startswith("__IMAGE_SEND__"):
                 return delivery_content
-            
+
             # 如果没有备注信息，直接返回发货内容
             if not card_description or not card_description.strip():
                 return delivery_content
 
-            # 替换备注中的变量
-            processed_description = card_description.replace('{DELIVERY_CONTENT}', delivery_content)
+            key_aliases = ('{DELIVERY_CONTENT}', '{key}', '{KEY}', '{content}')
+            has_key_variable = any(alias in card_description for alias in key_aliases)
 
-            # 如果备注中包含变量替换，返回处理后的备注
-            if '{DELIVERY_CONTENT}' in card_description:
+            processed_description = card_description
+            for name, value in (
+                ('{DELIVERY_CONTENT}', delivery_content),
+                ('{key}', delivery_content),
+                ('{KEY}', delivery_content),
+                ('{content}', delivery_content),
+                ('{card_name}', card_name or ''),
+                ('{item_title}', item_title or ''),
+                ('{buyer_id}', buyer_id or ''),
+                ('{order_id}', order_id or ''),
+            ):
+                if name in processed_description:
+                    processed_description = processed_description.replace(name, value)
+
+            # 备注里指定了卡密位置 → 整段备注就是最终文案
+            if has_key_variable:
                 return processed_description
-            else:
-                # 如果备注中没有变量，将备注和发货内容组合
-                return f"{processed_description}\n\n{delivery_content}"
+
+            # 否则保持原行为：备注在前，卡密在后
+            return f"{processed_description}\n\n{delivery_content}"
 
         except Exception as e:
             logger.error(f"处理备注信息失败: {e}")

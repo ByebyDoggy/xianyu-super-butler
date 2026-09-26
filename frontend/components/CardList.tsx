@@ -537,15 +537,28 @@ const CardList: React.FC = () => {
                   <p className="text-xs text-gray-500 mt-1">0表示立即发货，最大3600秒（1小时）</p>
                 </div>
 
-                {/* 备注信息 */}
+                {/* 备注信息：这就是「发货语」模板，支持变量替换 */}
                 <div>
-                  <label className="block text-sm font-bold text-gray-700 mb-2">备注信息</label>
+                  <label className="block text-sm font-bold text-gray-700 mb-2">发货语（备注信息）</label>
                   <textarea
                     value={editForm.description || ''}
                     onChange={(e) => setEditForm({ ...editForm, description: e.target.value })}
                     className="ios-input h-32 w-full resize-y rounded-md px-3 py-2.5"
-                    placeholder="可选的备注信息"
+                    placeholder={'例如：您好，你的卡密是{key} 请注意查收'}
                   />
+                  <div className="mt-1 space-y-0.5 text-xs leading-5 text-gray-500">
+                    <p>
+                      用 <span className="font-mono">{'{key}'}</span>（或{' '}
+                      <span className="font-mono">{'{DELIVERY_CONTENT}'}</span>）代表卡密内容。
+                      文案里含这个变量时，整段备注就是最终发送内容；不含时，备注会放在卡密前面。
+                    </p>
+                    <p>
+                      其它变量：<span className="font-mono">{'{card_name}'}</span> 卡密名称、
+                      <span className="font-mono">{'{item_title}'}</span> 商品标题、
+                      <span className="font-mono">{'{buyer_id}'}</span> 买家ID、
+                      <span className="font-mono">{'{order_id}'}</span> 订单号。
+                    </p>
+                  </div>
                 </div>
 
                 {/* 启用状态 */}
@@ -703,13 +716,20 @@ const CardList: React.FC = () => {
                 </div>
 
                 <div>
-                  <label className="block text-sm font-bold text-gray-700 mb-2">描述</label>
+                  <label className="block text-sm font-bold text-gray-700 mb-2">发货语（描述）</label>
                   <textarea
                     value={addForm.description}
                     onChange={(e) => setAddForm({ ...addForm, description: e.target.value })}
-                    placeholder="卡密用途描述"
+                    placeholder={'例如：您好，你的卡密是{key} 请注意查收'}
                     className="ios-input h-20 w-full resize-y rounded-md px-3 py-2.5"
                   />
+                  <p className="mt-1 text-xs leading-5 text-gray-500">
+                    用 <span className="font-mono">{'{key}'}</span> 代表卡密内容；
+                    还支持 <span className="font-mono">{'{card_name}'}</span>、
+                    <span className="font-mono">{'{item_title}'}</span>、
+                    <span className="font-mono">{'{buyer_id}'}</span>、
+                    <span className="font-mono">{'{order_id}'}</span>。
+                  </p>
                 </div>
 
                 <div>
