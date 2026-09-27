@@ -34,6 +34,12 @@ import {
 } from '../services/api';
 import { confirmAction, notify } from '../services/feedback';
 import { EmptyState, PageHeader, PageLoading, SectionHeader } from './ui';
+import {
+  PROMPT_INTENTS,
+  composeCustomPrompts,
+  isUsingBuiltin,
+  parseCustomPrompts,
+} from '../lib/promptTemplates';
 
 // 自建中转，兼容 OpenAI 接口，每天可领免费额度，省去用户自己找服务商配密钥。
 const FREE_TOKEN_BASE_URL = 'https://ai.corleom.com/v1';
@@ -65,6 +71,11 @@ const AIReply: React.FC = () => {
   const [showApiKey, setShowApiKey] = useState(false);
   const [testMessage, setTestMessage] = useState('你好，这个商品现在还能买吗？');
   const [testReply, setTestReply] = useState('');
+
+  // 系统提示词模板（按意图）+ 卖家补充规则；两者最终合成一个 custom_prompts 字段
+  const [promptTemplates, setPromptTemplates] = useState<Record<string, string>>({});
+  const [extraRules, setExtraRules] = useState('');
+  const [builtinPrompts, setBuiltinPrompts] = useState<Record<string, string>>({});
 
   // 提示词预览：不调用模型，只把最终拼出来的结构展示出来
   const [previewing, setPreviewing] = useState(false);
@@ -131,7 +142,13 @@ const AIReply: React.FC = () => {
     setShowApiKey(false);
     setPreview(null);
     getAccountAISettings(selectedAccountId)
-      .then(data => setSettings({ ...defaultSettings, ...data, api_key: '' }))
+      .then(data => {
+        setSettings({ ...defaultSettings, ...data, api_key: '' });
+        setBuiltinPrompts(data.default_prompts || {});
+        const parsedPrompts = parseCustomPrompts(data.custom_prompts || '');
+        setPromptTemplates(parsedPrompts.templates);
+        setExtraRules(parsedPrompts.extraRules);
+      })
       .catch(error => notify(error instanceof Error ? error.message : 'AI配置加载失败', 'error'))
       .finally(() => setLoading(false));
   }, [selectedAccountId]);
@@ -163,9 +180,15 @@ const AIReply: React.FC = () => {
 
     setSaving(true);
     try {
-      await updateAccountAISettings(selectedAccountId, settings);
+      // 界面把提示词拆成了「按意图的模板 + 补充规则」两块，存库前合回 custom_prompts
+      const customPrompts = composeCustomPrompts(promptTemplates, extraRules, builtinPrompts);
+      await updateAccountAISettings(selectedAccountId, { ...settings, custom_prompts: customPrompts });
       const refreshed = await getAccountAISettings(selectedAccountId);
       setSettings({ ...defaultSettings, ...refreshed, api_key: '' });
+      setBuiltinPrompts(refreshed.default_prompts || builtinPrompts);
+      const parsedPrompts = parseCustomPrompts(refreshed.custom_prompts || '');
+      setPromptTemplates(parsedPrompts.templates);
+      setExtraRules(parsedPrompts.extraRules);
       notify('人工智能回复配置已保存', 'success');
     } catch (error) {
       notify(error instanceof Error ? error.message : 'AI配置保存失败', 'error');
@@ -502,14 +525,77 @@ const AIReply: React.FC = () => {
                     />
                   </label>
                   <label className="sm:col-span-3">
-                    <span className="mb-1.5 block text-sm font-semibold text-gray-700">回复风格与业务规则</span>
+                    <span className="mb-1.5 block text-sm font-semibold text-gray-700">卖家补充规则（追加）</span>
                     <textarea
-                      value={settings.custom_prompts}
-                      onChange={event => updateSetting('custom_prompts', event.target.value)}
-                      className="ios-input min-h-36 w-full resize-y rounded-md px-3 py-2.5 text-sm leading-6"
+                      value={extraRules}
+                      onChange={event => setExtraRules(event.target.value)}
+                      className="ios-input min-h-28 w-full resize-y rounded-md px-3 py-2.5 text-sm leading-6"
                       placeholder="例如：语气简洁，不承诺未确认的库存；涉及售后时引导买家说明订单号。"
                     />
+                    <p className="mt-1 text-xs leading-5 text-gray-500">
+                      这部分会作为「卖家补充规则」<b>追加</b>在角色设定之后（不覆盖它）。
+                      要改上方的角色设定模板，请用下面的「系统提示词模板」。
+                    </p>
                   </label>
+                </div>
+              </section>
+
+              <section className="section-panel">
+                <SectionHeader
+                  title="系统提示词模板"
+                  description="角色设定那几行（“你是一位…客服…语言要求…”）就是从这里来的；按意图分别配置，留空或恢复默认则用内置模板。"
+                  icon={Layers}
+                />
+                <div className="grid gap-4 p-5">
+                  {PROMPT_INTENTS.map(intent => (
+                    <div key={intent.key} className="rounded-md border border-gray-200 p-3">
+                      <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
+                        <div>
+                          <span className="text-sm font-semibold text-gray-800">{intent.label}</span>
+                          <span className="ml-2 text-xs text-gray-500">{intent.hint}</span>
+                        </div>
+                        <div className="flex items-center gap-2">
+                          <span
+                            className={`status-badge ${
+                              isUsingBuiltin(promptTemplates, builtinPrompts, intent.key)
+                                ? 'bg-gray-100 text-gray-600'
+                                : 'status-badge-success'
+                            }`}
+                          >
+                            {isUsingBuiltin(promptTemplates, builtinPrompts, intent.key) ? '使用内置默认' : '已自定义'}
+                          </span>
+                          <button
+                            type="button"
+                            onClick={() =>
+                              setPromptTemplates(current => ({
+                                ...current,
+                                [intent.key]: builtinPrompts[intent.key] || '',
+                              }))
+                            }
+                            className="rounded-md px-2 py-1 text-xs font-bold text-blue-600 hover:bg-blue-50"
+                          >
+                            恢复内置默认
+                          </button>
+                        </div>
+                      </div>
+                      <textarea
+                        value={
+                          promptTemplates[intent.key] !== undefined
+                            ? promptTemplates[intent.key]
+                            : builtinPrompts[intent.key] || ''
+                        }
+                        onChange={event =>
+                          setPromptTemplates(current => ({ ...current, [intent.key]: event.target.value }))
+                        }
+                        className="ios-input min-h-32 w-full resize-y rounded-md px-3 py-2.5 font-mono text-xs leading-6"
+                      />
+                    </div>
+                  ))}
+
+                  <p className="text-xs leading-5 text-gray-500">
+                    与内置模板完全一致（或留空）时<b>不会</b>写进配置 —— 以后内置模板升级了，
+                    本账号还能跟着升级，而不会被一份旧副本钉住。只有真改动了才存下来。
+                  </p>
                 </div>
               </section>
 

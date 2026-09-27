@@ -546,6 +546,8 @@ export interface AIReplySettings {
   context_message_limit: number;
   context_expire_minutes: number;
   custom_prompts: string;
+  /** 后端返回的内置角色设定模板（default / price / tech），供前端预填与“恢复默认” */
+  default_prompts?: Record<string, string>;
 }
 
 // Default Reply

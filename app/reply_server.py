@@ -6200,6 +6200,14 @@ def _public_ai_reply_settings(settings: dict) -> dict:
     public_settings = dict(settings)
     public_settings['api_key_configured'] = bool(public_settings.get('api_key'))
     public_settings['api_key'] = ''
+    # 内置角色设定模板：前端需要它把每个意图的模板预填出来，并提供“恢复默认”。
+    # 不带上就得在前端再拄一份，两边早晚不一致。
+    from app.ai_reply_engine import ai_reply_engine
+
+    public_settings['default_prompts'] = {
+        key: ai_reply_engine.default_prompts.get(key, '')
+        for key in ('default', 'price', 'tech')
+    }
     return public_settings
 
 

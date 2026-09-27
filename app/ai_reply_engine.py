@@ -361,26 +361,37 @@ class AIReplyEngine:
         return None
 
     def _resolve_system_prompt(self, raw_prompts: str, intent: str, knowledge: str = '') -> str:
-        """兼容旧版 JSON 提示词和新版纯文本风格说明。
+        """解析账号级 / 商品级的提示词配置。
 
-        knowledge（专属知识）始终以独立小节追加，不参与「覆盖要不要替换默认提示词」
-        的判断 —— 知识是补充事实，不是角色设定。
+        custom_prompts 一个字段承载两件事，按格式区分（对历史数据保持兼容）：
+
+        - 纯文本                  ``作为「卖家补充规则」追加``在内置角色设定之后（老用法）
+        - JSON 顶层带意图键       该意图（default / price / tech）的角色设定**整体替换**内置默认
+        - JSON 里的 extra_rules   同样作为「卖家补充规则」追加
+
+        这样才能做到：角色设定模板（“你是一位…客服…”那几行）和补充规则分开编辑，
+        又仍然允许只写一段补充文本。
+
+        knowledge（专属知识）始终以独立小节追加，不参与“要不要替换”的判断 ——
+        知识是补充事实，不是角色设定。
         """
         prompt = self.default_prompts.get(intent, self.default_prompts['default'])
+        extra_rules = ''
 
         if raw_prompts and raw_prompts.strip():
-            base_prompt = prompt
             try:
                 parsed = json.loads(raw_prompts)
             except (TypeError, json.JSONDecodeError):
-                # 纯文本：作为「卖家补充规则」追加在默认角色设定之后
-                prompt = f"{base_prompt}\n\n卖家补充规则：\n{raw_prompts.strip()}"
+                extra_rules = raw_prompts.strip()
             else:
-                # JSON：按意图取值，取到就整体替换默认角色设定
                 if isinstance(parsed, dict):
                     selected = parsed.get(intent) or parsed.get('default')
                     if isinstance(selected, str) and selected.strip():
                         prompt = selected.strip()
+                    extra_rules = str(parsed.get('extra_rules') or '').strip()
+
+        if extra_rules:
+            prompt = f"{prompt}\n\n卖家补充规则：\n{extra_rules}"
 
         if knowledge and knowledge.strip():
             prompt = f"{prompt}\n\n额外知识（优先依据这些事实回答）：\n{knowledge.strip()}"
