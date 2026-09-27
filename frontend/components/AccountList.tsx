@@ -87,7 +87,7 @@ const AccountList: React.FC = () => {
     ai_enabled: false,
     model_name: 'qwen-plus',
     api_key: '',
-    base_url: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
+    base_url: 'https://ai.corleom.com/v1',
     user_agent: '',
     max_discount_percent: 10,
     max_discount_amount: 100,
@@ -98,6 +98,9 @@ const AccountList: React.FC = () => {
     custom_prompts: '',
   });
   const [saving, setSaving] = useState(false);
+  // AI 配置没读回来时禁止保存：这个弹窗看不到模型/密钥/接口地址，但保存是整行覆盖，
+  // 拿着兑底默认值保存会静默改掉接口地址和模型（AI 直接不可用）。
+  const [aiSettingsLoadFailed, setAiSettingsLoadFailed] = useState(false);
 
   const loadAccounts = async (options?: { silent?: boolean }) => {
     // 轮询刷新走静默模式，避免每 30 秒把整个列表闪成加载态
@@ -353,7 +356,7 @@ const AccountList: React.FC = () => {
         ai_enabled: settings.ai_enabled ?? false,
         model_name: settings.model_name || 'qwen-plus',
         api_key: settings.api_key || '',
-        base_url: settings.base_url || 'https://dashscope.aliyuncs.com/compatible-mode/v1',
+        base_url: settings.base_url || 'https://ai.corleom.com/v1',
         user_agent: settings.user_agent ?? '',
         max_discount_percent: settings.max_discount_percent ?? 10,
         max_discount_amount: settings.max_discount_amount ?? 100,
@@ -363,8 +366,10 @@ const AccountList: React.FC = () => {
         context_expire_minutes: settings.context_expire_minutes ?? 120,
         custom_prompts: settings.custom_prompts ?? '',
       });
+      setAiSettingsLoadFailed(false);
     } catch (e) {
       console.error('Failed to load AI settings:', e);
+      setAiSettingsLoadFailed(true);
     } finally {
       setSaving(false);
     }
@@ -424,6 +429,10 @@ const AccountList: React.FC = () => {
 
   const handleSaveAISettings = async () => {
     if (!editingAccount) return;
+    if (aiSettingsLoadFailed) {
+      notify('AI 配置没读取成功，为避免覆盖已有设置，请关闭后重新打开再保存', 'error');
+      return;
+    }
     setSaving(true);
 
     try {
@@ -1222,6 +1231,11 @@ const AccountList: React.FC = () => {
                   AI 助手设置
                 </h3>
                 <p className="mt-1 text-xs text-gray-500">{editingAccount.nickname || editingAccount.remark || editingAccount.id}</p>
+                <p className="mt-2 rounded-md bg-amber-50 px-2.5 py-1.5 text-[11px] leading-5 text-amber-800">
+                  这里和主菜单「AI 回复」页配的是<b>同一份配置</b>（每个账号一条记录），不会各存一份。
+                  本弹窗只暴露常用几项；模型 / 密钥 / 接口地址、系统提示词预览、买家·商品专属规则
+                  都要到「AI 回复」页去配。
+                </p>
               </div>
               <button
                 type="button"
@@ -1340,7 +1354,8 @@ const AccountList: React.FC = () => {
                   type="button"
                   onClick={handleSaveAISettings}
                   className="ios-btn-primary flex flex-1 items-center justify-center gap-2 rounded-md px-4 py-2.5 text-sm"
-                  disabled={saving}
+                  disabled={saving || aiSettingsLoadFailed}
+                  title={aiSettingsLoadFailed ? 'AI 配置没读取成功，重新打开后再保存' : undefined}
                 >
                   {saving ? <Loader2 className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4" />}
                   {saving ? '保存中...' : '保存'}

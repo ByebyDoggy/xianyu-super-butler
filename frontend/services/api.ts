@@ -897,11 +897,16 @@ export const getAccountAISettings = async (cookieId: string): Promise<AIReplySet
 }
 
 export const updateAccountAISettings = async (cookieId: string, settings: Partial<AIReplySettings>): Promise<ApiResponse> => {
+  // 后端 PUT 是"整行覆盖"，所以这里必须把字段发齐：少发一个就会被后端默认值默默重置。
+  // user_agent 之前就漏了，于是一次保存就把自定义 UA 洗掉（目前只影响请求头，但没人会想到）。
+  // base_url 的兜底值要和主菜单「AI 回复」页保持一致，否则同一个账号在两边保存
+  // 会得到两个不同的接口地址（key 与 host 不匹配时 AI 直接不可用）。
   const payload = {
     ai_enabled: settings.ai_enabled ?? false,
     model_name: settings.model_name ?? 'qwen-plus',
     api_key: settings.api_key ?? '',
-    base_url: settings.base_url ?? 'https://dashscope.aliyuncs.com/compatible-mode/v1',
+    base_url: settings.base_url ?? 'https://ai.corleom.com/v1',
+    user_agent: settings.user_agent ?? '',
     max_discount_percent: settings.max_discount_percent ?? 10,
     max_discount_amount: settings.max_discount_amount ?? 100,
     max_bargain_rounds: settings.max_bargain_rounds ?? 3,
