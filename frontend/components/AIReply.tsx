@@ -9,6 +9,7 @@ import {
   Layers,
   Loader2,
   MessageSquareText,
+  Package,
   Pencil,
   Play,
   Plus,
@@ -18,13 +19,14 @@ import {
   UserRound,
   X,
 } from 'lucide-react';
-import { AccountDetail, AIReplySettings, AIReplyOverride, AIReplyPromptPreview } from '../types';
+import { AccountDetail, AIReplySettings, AIReplyOverride, AIReplyPromptPreview, Item } from '../types';
 import {
   createAIReplyOverride,
   deleteAIReplyOverride,
   getAccountAISettings,
   getAccountDetails,
   getAIReplyOverrides,
+  getItems,
   previewAIReplyPrompt,
   testAIConnection,
   updateAccountAISettings,
@@ -78,6 +80,9 @@ const AIReply: React.FC = () => {
   const [overrideModalOpen, setOverrideModalOpen] = useState(false);
   const [editingOverrideId, setEditingOverrideId] = useState<number | null>(null);
   const [savingOverride, setSavingOverride] = useState(false);
+  // 商品直接从事先同步好的商品列表里选，不用去别处手抄商品 ID
+  const [accountItems, setAccountItems] = useState<Item[]>([]);
+  const [itemPickMode, setItemPickMode] = useState<'list' | 'manual'>('list');
   const [overrideForm, setOverrideForm] = useState({
     buyer_id: '',
     item_id: '',
@@ -92,6 +97,22 @@ const AIReply: React.FC = () => {
     () => accounts.find(account => account.id === selectedAccountId),
     [accounts, selectedAccountId],
   );
+
+  // 该账号的商品列表。商品级提示词是「这个账号的这个商品」，
+  // 不同账号的同名商品互不影响（规则本身挂在 cookie_id 下）。
+  const itemsForAccount = useMemo(
+    () => accountItems.filter(item => item.cookie_id === selectedAccountId),
+    [accountItems, selectedAccountId],
+  );
+
+  const itemTitleOf = (itemId: string) =>
+    itemsForAccount.find(item => item.item_id === itemId)?.item_title || '';
+
+  useEffect(() => {
+    getItems()
+      .then(list => setAccountItems(Array.isArray(list) ? list : []))
+      .catch(() => setAccountItems([]));
+  }, []);
 
   useEffect(() => {
     getAccountDetails()
@@ -197,10 +218,13 @@ const AIReply: React.FC = () => {
         priority: override.priority || 0,
         enabled: override.enabled !== false,
       });
+      // 旧规则的商品可能已经不在同步列表里（下架/删除），这时直接给手输框
+      const knownItem = itemsForAccount.some(item => item.item_id === override.item_id);
+      setItemPickMode(knownItem || !override.item_id ? 'list' : 'manual');
     } else {
       setEditingOverrideId(null);
       setOverrideForm({
-        buyer_id: previewBuyerId.trim(),
+        buyer_id: '',
         item_id: previewItemId.trim(),
         name: '',
         custom_prompts: '',
@@ -208,14 +232,15 @@ const AIReply: React.FC = () => {
         priority: 0,
         enabled: true,
       });
+      setItemPickMode('list');
     }
     setOverrideModalOpen(true);
   };
 
   const handleSaveOverride = async () => {
     if (!selectedAccountId) return;
-    if (!overrideForm.buyer_id.trim() && !overrideForm.item_id.trim()) {
-      notify('买家 ID 和商品 ID 至少要填一个', 'warning');
+    if (!overrideForm.item_id.trim() && !overrideForm.buyer_id.trim()) {
+      notify('请选择商品（或在“高级”里填买家 ID）', 'warning');
       return;
     }
     if (!overrideForm.custom_prompts.trim() && !overrideForm.knowledge.trim()) {
@@ -570,21 +595,31 @@ const AIReply: React.FC = () => {
                         className="ios-input w-full rounded-md px-3 py-2.5 text-sm"
                       />
                     </label>
+                    <label className="sm:col-span-4">
+                      <span className="mb-1.5 block text-sm font-semibold text-gray-700">
+                        商品（选择后会自动带出商品事实，并用它验证商品级规则是否命中）
+                      </span>
+                      <select
+                        value={previewItemId}
+                        onChange={event => setPreviewItemId(event.target.value)}
+                        className="ios-input w-full rounded-md px-3 py-2.5 text-sm"
+                      >
+                        <option value="">不指定商品（只验证账号级配置）</option>
+                        {itemsForAccount.map(item => (
+                          <option key={item.item_id} value={item.item_id}>
+                            {item.item_title || '（无标题）'} · {item.item_id}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
                     <label className="sm:col-span-2">
-                      <span className="mb-1.5 block text-sm font-semibold text-gray-700">买家 ID（可选）</span>
+                      <span className="mb-1.5 block text-sm font-semibold text-gray-700">
+                        买家 ID（可选，仅用于验证买家级规则）
+                      </span>
                       <input
                         value={previewBuyerId}
                         onChange={event => setPreviewBuyerId(event.target.value)}
-                        placeholder="用于验证买家级规则是否命中"
-                        className="ios-input w-full rounded-md px-3 py-2.5 text-sm"
-                      />
-                    </label>
-                    <label>
-                      <span className="mb-1.5 block text-sm font-semibold text-gray-700">商品 ID（可选）</span>
-                      <input
-                        value={previewItemId}
-                        onChange={event => setPreviewItemId(event.target.value)}
-                        placeholder="会自动带出商品事实"
+                        placeholder="一般不用填"
                         className="ios-input w-full rounded-md px-3 py-2.5 text-sm"
                       />
                     </label>
@@ -612,13 +647,13 @@ const AIReply: React.FC = () => {
                         <span className="status-badge status-badge-info">上下文 {preview.context_message_count} 条</span>
                         {preview.override ? (
                           <span className="status-badge bg-emerald-100 text-emerald-800">
-                            命中专属规则：{preview.override.name || '（未命名）'}
-                            （买家 {preview.override.buyer_id || '不限'} / 商品 {preview.override.item_id || '不限'}；
+                            命中商品专属规则：{preview.override.name || '（未命名）'}
+                            （商品 {preview.override.item_id || '不限'} / 买家 {preview.override.buyer_id || '不限'}；
                             {preview.override.used_custom_prompts ? '提示词已覆盖' : '提示词用账号级'}；
                             知识 {preview.override.knowledge_chars} 字）
                           </span>
                         ) : (
-                          <span className="status-badge bg-gray-100 text-gray-600">未命中专属规则，使用账号级配置</span>
+                          <span className="status-badge bg-gray-100 text-gray-600">未命中商品专属规则，使用账号级配置</span>
                         )}
                       </div>
 
@@ -698,9 +733,9 @@ const AIReply: React.FC = () => {
 
               <section className="section-panel">
                 <SectionHeader
-                  title="买家 / 商品专属提示词"
-                  description="给「某个买家的某个商品」单独设定提示词与知识，命中时优先于账号级配置。"
-                  icon={UserRound}
+                  title="商品专属提示词（按账号 + 商品）"
+                  description="给「这个卖家账号的这个商品」单独设定提示词与知识；不同账号的同名商品互不影响。"
+                  icon={Package}
                   actions={(
                     <button
                       type="button"
@@ -714,25 +749,27 @@ const AIReply: React.FC = () => {
                 />
                 <div className="p-5">
                   <p className="mb-3 text-xs leading-5 text-gray-500">
-                    匹配优先级：买家+商品（最具体） &gt; 只限买家 / 只限商品 &gt; 都不限（等同账号级）；
-                    同样命中时比较「优先级」，数值大的生效。留空的维度表示「不限」。
+                    三层关系：上方「回复策略」是<b>账号级</b>（本账号全部商品共用）→
+                    本面板是<b>商品级</b>（本账号的指定商品）→ 填了买家 ID 则是<b>买家级</b>（该商品下的单个买家，
+                    仅用于老客户等特殊优待，一般不用填）。
+                    命中顺序：买家+商品 &gt; 只限商品 &gt; 账号级；同级时比「优先级」，数值大的生效。
                   </p>
 
                   {overrides.length === 0 ? (
                     <EmptyState
                       compact
-                      title="暂无专属规则"
-                      description="例如：给老客户单独放宽松的议价口径，或给某个商品补充专用知识。"
-                      icon={UserRound}
+                      title="暂无商品专属规则"
+                      description="例如：某个商品是虚拟卡密，需要补充「不支持无理由退款」；或某个商品的议价口径与其它商品不同。"
+                      icon={Package}
                     />
                   ) : (
                     <div className="overflow-x-auto">
                       <table className="w-full text-sm">
                         <thead>
                           <tr className="border-b border-gray-200 text-left text-xs text-gray-500">
-                            <th className="py-2 pr-3">名称</th>
-                            <th className="py-2 pr-3">买家 ID</th>
-                            <th className="py-2 pr-3">商品 ID</th>
+                            <th className="py-2 pr-3">规则名称</th>
+                            <th className="py-2 pr-3">商品</th>
+                            <th className="py-2 pr-3">买家（可选）</th>
                             <th className="py-2 pr-3">专属提示词</th>
                             <th className="py-2 pr-3">专属知识</th>
                             <th className="py-2 pr-3">优先级</th>
@@ -744,8 +781,19 @@ const AIReply: React.FC = () => {
                           {overrides.map(override => (
                             <tr key={override.id} className="border-b border-gray-100">
                               <td className="py-2 pr-3 font-semibold text-gray-800">{override.name || '-'}</td>
+                              <td className="py-2 pr-3">
+                                {override.item_id ? (
+                                  <div className="min-w-0">
+                                    <div className="truncate text-xs text-gray-800" title={override.item_id}>
+                                      {itemTitleOf(override.item_id) || '（未同步到的商品）'}
+                                    </div>
+                                    <div className="font-mono text-[10px] text-gray-400">{override.item_id}</div>
+                                  </div>
+                                ) : (
+                                  <span className="text-xs text-gray-500">不限（本账号全部商品）</span>
+                                )}
+                              </td>
                               <td className="py-2 pr-3 font-mono text-xs text-gray-600">{override.buyer_id || '不限'}</td>
-                              <td className="py-2 pr-3 font-mono text-xs text-gray-600">{override.item_id || '不限'}</td>
                               <td className="py-2 pr-3 text-xs text-gray-600">
                                 {override.custom_prompts ? `${override.custom_prompts.length} 字` : '（用账号级）'}
                               </td>
@@ -844,7 +892,8 @@ const AIReply: React.FC = () => {
                   {editingOverrideId ? '编辑专属规则' : '新增专属规则'}
                 </h3>
                 <p className="mt-1 text-xs text-gray-500">
-                  买家 ID 与商品 ID 至少要填一个；留空的那一维表示「不限」。
+                  选一个商品 = 给「本账号的这个商品」单独设定提示词与知识。
+                  买家 ID 留空即对访商品的<b>所有买家</b>生效（大多数情况就该留空）。
                 </p>
               </div>
               <button
@@ -858,31 +907,55 @@ const AIReply: React.FC = () => {
             </div>
 
             <div className="modal-body space-y-4">
-              <div className="grid gap-3 sm:grid-cols-2">
-                <label>
-                  <span className="mb-1.5 block text-sm font-semibold text-gray-700">买家 ID</span>
-                  <input
-                    value={overrideForm.buyer_id}
-                    onChange={event => setOverrideForm({ ...overrideForm, buyer_id: event.target.value })}
-                    placeholder="留空 = 不限买家"
+              {/* 商品是主维度：直接从事先同步好的商品列表选，不用手抄 ID */}
+              <div className="rounded-md border border-gray-200 bg-gray-50 p-3">
+                <div className="mb-2 flex items-center justify-between gap-2">
+                  <span className="text-sm font-semibold text-gray-700">商品</span>
+                  <button
+                    type="button"
+                    onClick={() => setItemPickMode(itemPickMode === 'list' ? 'manual' : 'list')}
+                    className="text-xs font-bold text-blue-600 hover:underline"
+                  >
+                    {itemPickMode === 'list' ? '列表里没有？手动输入商品 ID' : '返回列表选择'}
+                  </button>
+                </div>
+                {itemPickMode === 'list' ? (
+                  <select
+                    value={overrideForm.item_id}
+                    onChange={event => setOverrideForm({ ...overrideForm, item_id: event.target.value })}
                     className="ios-input w-full rounded-md px-3 py-2.5 text-sm"
-                  />
-                </label>
-                <label>
-                  <span className="mb-1.5 block text-sm font-semibold text-gray-700">商品 ID</span>
+                  >
+                    <option value="">不限商品（本账号全部商品生效，等同把账号级设置改宽）</option>
+                    {itemsForAccount.map(item => (
+                      <option key={item.item_id} value={item.item_id}>
+                        {item.item_title || '（无标题）'} · {item.item_id}
+                      </option>
+                    ))}
+                  </select>
+                ) : (
                   <input
                     value={overrideForm.item_id}
                     onChange={event => setOverrideForm({ ...overrideForm, item_id: event.target.value })}
-                    placeholder="留空 = 不限商品"
-                    className="ios-input w-full rounded-md px-3 py-2.5 text-sm"
+                    placeholder="粘贴闲鱼商品 ID，例如 1084753907064"
+                    className="ios-input w-full rounded-md px-3 py-2.5 font-mono text-sm"
                   />
-                </label>
+                )}
+                <p className="mt-1 text-xs text-gray-500">
+                  {itemsForAccount.length > 0
+                    ? `本账号已同步 ${itemsForAccount.length} 个商品；商品 ID 与「商品与发货」页显示的一致。`
+                    : '本账号还没有同步到商品，可先去「商品与发货」同步，或手动输入商品 ID。'}
+                </p>
+              </div>
+
+              <div className="grid gap-3 sm:grid-cols-2">
                 <label>
-                  <span className="mb-1.5 block text-sm font-semibold text-gray-700">规则名称（便于识别）</span>
+                  <span className="mb-1.5 block text-sm font-semibold text-gray-700">
+                    规则名称（便于识别）
+                  </span>
                   <input
                     value={overrideForm.name}
                     onChange={event => setOverrideForm({ ...overrideForm, name: event.target.value })}
-                    placeholder="例如：老客户-某商品"
+                    placeholder="例如：某商品-卡密售后规则"
                     className="ios-input w-full rounded-md px-3 py-2.5 text-sm"
                   />
                 </label>
@@ -896,6 +969,21 @@ const AIReply: React.FC = () => {
                   />
                 </label>
               </div>
+
+              <details className="rounded-md border border-gray-200 px-3 py-2">
+                <summary className="cursor-pointer text-xs font-bold text-gray-600">
+                  高级：只对某个买家单独优待（可选，一般不用填）
+                </summary>
+                <label className="mt-2 block">
+                  <span className="mb-1.5 block text-sm font-semibold text-gray-700">买家 ID</span>
+                  <input
+                    value={overrideForm.buyer_id}
+                    onChange={event => setOverrideForm({ ...overrideForm, buyer_id: event.target.value })}
+                    placeholder="留空 = 该商品的所有买家都生效"
+                    className="ios-input w-full rounded-md px-3 py-2.5 font-mono text-sm"
+                  />
+                </label>
+              </details>
 
               <label className="block">
                 <span className="mb-1.5 block text-sm font-semibold text-gray-700">
