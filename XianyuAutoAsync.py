@@ -1738,12 +1738,18 @@ class XianyuLive:
                     from app.db_manager import db_manager
                     item_info = db_manager.get_item_info(self.cookie_id, item_id)
                     if not item_info:
-                        logger.warning(f'[{msg_time}] 【{self.cookie_id}】❌ 商品 {item_id} 不属于当前账号，跳过自动发货')
-                        return
-                    logger.warning(f'[{msg_time}] 【{self.cookie_id}】✅ 商品 {item_id} 归属验证通过')
+                        # item_info 只是本地缓存：商品没同步到并不代表它不属于本账号。
+                        # 原来这里直接 return，于是一批本来能发的单被白白跳过。
+                        # 真正的归属由下面的「订单归属」校验保证（订单得落在本账号名下，
+                        # 而发货规则也按 cookie_id + item_id 绑定），所以这里只提醒不拦。
+                        logger.warning(
+                            f'[{msg_time}] 【{self.cookie_id}】商品 {item_id} 未同步到本地缓存，'
+                            f'继续按订单归属校验决定是否发货'
+                        )
+                    else:
+                        logger.info(f'[{msg_time}] 【{self.cookie_id}】✅ 商品 {item_id} 归属验证通过')
                 except Exception as e:
-                    logger.error(f'[{msg_time}] 【{self.cookie_id}】检查商品归属失败: {self._safe_str(e)}，跳过自动发货')
-                    return
+                    logger.error(f'[{msg_time}] 【{self.cookie_id}】检查商品归属失败: {self._safe_str(e)}，继续按订单归属校验')
 
             # 提取订单ID
             order_id = self._extract_order_id(message)
@@ -1760,12 +1766,22 @@ class XianyuLive:
                 if str(current_order.get('cookie_id') or '') != str(self.cookie_id):
                     logger.error(f'[{msg_time}] 【{self.cookie_id}】订单 {order_id} 不属于当前账号，拒绝自动发货')
                     return
-                if current_order.get('item_id') and str(current_order.get('item_id')) != str(item_id):
+                if current_order.get('item_id') and item_id and str(current_order.get('item_id')) != str(item_id):
                     logger.error(f'[{msg_time}] 【{self.cookie_id}】订单 {order_id} 商品归属不一致，拒绝自动发货')
                     return
                 if current_order.get('buyer_id') and str(current_order.get('buyer_id')) != str(send_user_id):
                     logger.error(f'[{msg_time}] 【{self.cookie_id}】订单 {order_id} 买家归属不一致，拒绝自动发货')
                     return
+
+                # 消息里没提到商品时，沿用订单已记录的 item_id。
+                # 原来会把空 item_id 拿去和订单比（str(None) != '1084...' 永远成立），
+                # 把一批本来能正常发货的订单拒之门外。
+                if (not item_id or item_id == '未知商品') and current_order.get('item_id'):
+                    item_id = str(current_order.get('item_id'))
+                    logger.info(
+                        f'[{msg_time}] 【{self.cookie_id}】消息未提及商品，'
+                        f'沿用订单里的 item_id: {item_id}'
+                    )
 
             order_status = (current_order or {}).get('order_status')
             order_detail = None
@@ -4325,87 +4341,99 @@ class XianyuLive:
             await asyncio.sleep(0.5)
             return await self.get_item_info(item_id, retry_count + 1)
 
-    def extract_item_id_from_message(self, message):
-        """从消息中提取商品ID的辅助方法"""
+    def _item_exists(self, item_id: str) -> bool:
+        """该 item_id 是否为本账号真实存在的商品。"""
         try:
-            # 方法1: 从message["1"]中提取（如果是字符串格式）
-            message_1 = message.get('1')
-            if isinstance(message_1, str):
-                # 尝试从字符串中提取数字ID
-                id_match = re.search(r'(\d{10,})', message_1)
-                if id_match:
-                    logger.info(f"从message[1]字符串中提取商品ID: {id_match.group(1)}")
-                    return id_match.group(1)
+            from app.db_manager import db_manager
 
-            # 方法2: 从message["3"]中提取
+            return bool(db_manager.get_item_info(self.cookie_id, str(item_id)))
+        except Exception:
+            return False
+
+    def extract_item_id_from_message(self, message):
+        """从消息中提取商品ID。
+
+        ⚠️ 这里曾经把「聊天对端 ID」当成商品 ID：message['1'] 在字符串形态下是
+        形如 67259324234@goofish 的对端标识，而 re.search(r'(\\d{10,})')
+        会把其中的数字抠出来当商品 ID 返回（递归遍历那段一样会犯）。
+
+        后果不是「少发一单」这么简单，而是一条完整的故障链：
+
+          1. 订单快照把这个错 ID 写进 orders.item_id；
+          2. 付款触发消息（字典形态）到达时解析出真正的商品 ID；
+          3. 发货前「订单商品归属一致性」校验必然不一致 → 直接拒绝自动发货；
+          4. 表现为「买家已经付款，系统却没发货」。
+
+        所以现在的规矩是：**所有候选值都必须通过「是本账号真实商品」的校验**，
+        且结构化字段（itemId / extension / bizData）优先于从文本里抠数字。
+        全都不过就返回 None —— 宁可不猜，也不能拿对端 ID 当商品 ID；
+        调用方 _handle_auto_delivery 在 item_id 为空时会回落到订单里已存的 item_id。
+        """
+        try:
+            candidates = []
+
+            def add(value):
+                """收集候选；跳过形如 xxx@goofish 的聊天对端标识"""
+                if value is None:
+                    return
+                text = str(value).strip()
+                if not text or '@' in text:
+                    return
+                if len(text) >= 10 and text.isdigit() and text not in candidates:
+                    candidates.append(text)
+
+            # 1) 结构化字段最可信
             message_3 = message.get('3', {})
             if isinstance(message_3, dict):
-
-                # 从extension中提取
-                if 'extension' in message_3:
-                    extension = message_3['extension']
-                    if isinstance(extension, dict):
-                        item_id = extension.get('itemId') or extension.get('item_id')
-                        if item_id:
-                            logger.info(f"从extension中提取商品ID: {item_id}")
-                            return item_id
-
-                # 从bizData中提取
-                if 'bizData' in message_3:
-                    biz_data = message_3['bizData']
-                    if isinstance(biz_data, dict):
-                        item_id = biz_data.get('itemId') or biz_data.get('item_id')
-                        if item_id:
-                            logger.info(f"从bizData中提取商品ID: {item_id}")
-                            return item_id
-
-                # 从其他可能的字段中提取
-                for key, value in message_3.items():
+                for container in ('extension', 'bizData'):
+                    data = message_3.get(container)
+                    if isinstance(data, dict):
+                        add(data.get('itemId') or data.get('item_id'))
+                for value in message_3.values():
                     if isinstance(value, dict):
-                        item_id = value.get('itemId') or value.get('item_id')
-                        if item_id:
-                            logger.info(f"从{key}字段中提取商品ID: {item_id}")
-                            return item_id
+                        add(value.get('itemId') or value.get('item_id'))
 
-                # 从消息内容中提取数字ID
-                content = message_3.get('content', '')
-                if isinstance(content, str) and content:
-                    id_match = re.search(r'(\d{10,})', content)
-                    if id_match:
-                        logger.info(f"【{self.cookie_id}】从消息内容中提取商品ID: {id_match.group(1)}")
-                        return id_match.group(1)
-
-            # 方法3: 遍历整个消息结构查找可能的商品ID
-            def find_item_id_recursive(obj, path=""):
+            # 2) 递归查找 itemId / item_id 字段
+            def find_item_fields(obj):
                 if isinstance(obj, dict):
-                    # 直接查找itemId字段
-                    for key in ['itemId', 'item_id', 'id']:
-                        if key in obj and isinstance(obj[key], (str, int)):
-                            value = str(obj[key])
-                            if len(value) >= 10 and value.isdigit():
-                                logger.info(f"从{path}.{key}中提取商品ID: {value}")
-                                return value
+                    for key in ('itemId', 'item_id'):
+                        if key in obj:
+                            add(obj[key])
+                    for value in obj.values():
+                        find_item_fields(value)
+                elif isinstance(obj, list):
+                    for value in obj:
+                        find_item_fields(value)
 
-                    # 递归查找
-                    for key, value in obj.items():
-                        result = find_item_id_recursive(value, f"{path}.{key}" if path else key)
-                        if result:
-                            return result
+            find_item_fields(message)
 
+            # 3) 最后才从文本里抠数字：这一层最容易抠到对端 ID，所以优先级最低
+            def collect_digits(obj):
+                if isinstance(obj, dict):
+                    for value in obj.values():
+                        collect_digits(value)
+                elif isinstance(obj, list):
+                    for value in obj:
+                        collect_digits(value)
                 elif isinstance(obj, str):
-                    # 从字符串中提取可能的商品ID
-                    id_match = re.search(r'(\d{10,})', obj)
-                    if id_match:
-                        logger.info(f"从{path}字符串中提取商品ID: {id_match.group(1)}")
-                        return id_match.group(1)
+                    for match in re.findall(r'\d{10,}', obj):
+                        add(match)
 
-                return None
+            collect_digits(message)
 
-            result = find_item_id_recursive(message)
-            if result:
-                return result
+            # 统一校验：只认本账号真实存在的商品
+            for candidate in candidates:
+                if self._item_exists(candidate):
+                    logger.info(f"【{self.cookie_id}】从消息中提取到商品ID: {candidate}")
+                    return candidate
 
-            logger.warning("所有方法都未能提取到商品ID")
+            if candidates:
+                logger.warning(
+                    f"【{self.cookie_id}】候选商品ID {candidates} 均不属于本账号，"
+                    f"视为消息未提及商品（将回落到订单里的 item_id）"
+                )
+            else:
+                logger.info(f"【{self.cookie_id}】消息中未提及商品ID")
             return None
 
         except Exception as e:
