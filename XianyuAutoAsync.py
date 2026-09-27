@@ -185,6 +185,18 @@ try:
 except (TypeError, ValueError):
     RECONNECT_INTERVAL = 0
 
+# 浏览器刷 Cookie 时访问的页面。
+#
+# 绝对不能用 https://www.goofish.com/im：那个页面自带官方 Web IM，会拿着同一份
+# 账号 Cookie 再建一条 IM 会话。闲鱼一个账号只保一条活跃的 IM 会话，机器人那条
+# 会被顶成「僵尸连接」——TCP 不断、心跳照回、我们自己的 /r/ 请求也照答，但平台
+# 不再推送任何买家消息。表现就是买家发消息机器人不回、买家付了款不自动发货，
+# 而日志里除了心跳什么都看不出来。更糟的是：一旦收不到消息，刷 Cookie 前那个
+# 「5 分钟内有消息就跳过刷新」的冷却永远不触发，于是每 20 分钟再顶一次，永久失明。
+#
+# 刷 Cookie 只需要页面跑一次 mtop，首页就能拿到同样的 session cookie，不需要 IM。
+COOKIE_REFRESH_PAGE_URL = "https://www.goofish.com/"
+
 class XianyuLive:
     # 类级别的锁字典，为每个order_id维护一个锁（用于自动发货）
     _order_locks = defaultdict(lambda: asyncio.Lock())
@@ -382,6 +394,12 @@ class XianyuLive:
                 else:
                     logger.debug(f"【{self.cookie_id}】买家互动任务已完成，跳过")
 
+            if self.inbound_watchdog_task:
+                if not self.inbound_watchdog_task.done():
+                    tasks_to_cancel.append(("入站推送看门狗", self.inbound_watchdog_task))
+                else:
+                    logger.debug(f"【{self.cookie_id}】入站推送看门狗已完成，跳过")
+
             if not tasks_to_cancel:
                 logger.info(f"【{self.cookie_id}】没有后台任务需要取消（所有任务已完成或不存在）")
                 # 立即重置任务引用
@@ -394,6 +412,7 @@ class XianyuLive:
                 self.item_polish_task = None
                 self.delivery_timeout_task = None
                 self.buyer_interaction_task = None
+                self.inbound_watchdog_task = None
                 return
             
             logger.info(f"【{self.cookie_id}】开始取消 {len(tasks_to_cancel)} 个未完成的后台任务...")
@@ -533,6 +552,7 @@ class XianyuLive:
             self.item_polish_task = None
             self.delivery_timeout_task = None
             self.buyer_interaction_task = None
+            self.inbound_watchdog_task = None
             logger.info(f"【{self.cookie_id}】后台任务引用已全部重置")
 
     # 平台风控/人机验证的特征串。命中后必须大幅退避 —— 继续高频重试只会
@@ -864,6 +884,16 @@ class XianyuLive:
         # 消息接收标识 - 用于控制Cookie刷新
         self.last_message_received_time = 0  # 记录上次收到消息的时间
         self.message_cookie_refresh_cooldown = 300  # 收到消息后5分钟内不执行Cookie刷新
+
+        # 入站推送看门狗。WebSocket 可能是「僵尸」状态：心跳和请求响应都正常，
+        # 但平台不再推送买家消息（实测被浏览器刷 Cookie 打开的 /im 页面顶掉）。
+        # 这里记录最后一次收到「平台主动推送」的时间，静默过久就主动重连重新 /reg。
+        self.inbound_watchdog_task = None
+        self.last_inbound_frame_time = time.time()
+        self.inbound_silence_threshold = 600  # 静默 10 分钟即判定推送通道被顶掉
+        self.inbound_silence_max_retries = 3  # 连续重连 3 次都收不到推送就放慢节奏
+        self.inbound_silence_max_interval = 1800  # 放慢后的判定阈值（30 分钟）
+        self._inbound_forced_reconnects = 0
 
         # 浏览器Cookie刷新成功标志
         self.browser_cookie_refreshed = False  # 标记_refresh_cookies_via_browser是否成功更新过数据库
@@ -8051,6 +8081,92 @@ class XianyuLive:
             # 确保任务能正常结束
             logger.info(f"【{self.cookie_id}】Cookie刷新循环已退出")
 
+    async def _force_ws_reconnect(self, reason: str) -> bool:
+        """主动断开 WebSocket，让主循环立刻重新 /reg。
+
+        平台侧会悄悄把某条 IM 会话降级：TCP 不断、心跳照回、我们自己的 /r/
+        请求也照答，但不再推送任何买家消息。这时唯一能恢复的办法就是重新注册
+        一次。主循环对「干净关闭」是立即重连的（不像异常断开要等重连间隔），
+        所以 close() 就够。
+        """
+        ws = self.ws
+        if ws is None or getattr(ws, "closed", False):
+            return False
+        try:
+            logger.warning(
+                f"【{self.cookie_id}】{reason}，主动断开 WebSocket 以重新注册 IM 会话"
+            )
+            await ws.close()
+            return True
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning(f"【{self.cookie_id}】主动断开 WebSocket 失败: {self._safe_str(e)}")
+            return False
+
+    async def inbound_watchdog_loop(self):
+        """入站推送看门狗。
+
+        背景：WebSocket 可能处于「僵尸」状态 —— 心跳正常、我们自己发起的 /r/
+        请求也正常，但平台不再推送买家消息。此时自动发货的
+        [我已付款，等待你发货] 和 AI 客服要回的买家消息都会静默丢失，而日志
+        里除了心跳什么都看不出来（订单就是这么被漏发的）。
+
+        判定：只有平台「主动推送」的帧才会刷新 last_inbound_frame_time，
+        心跳应答和自己请求的响应都不算。连续一段时间没有任何推送，就认定
+        推送通道被顶掉了，主动重连重新注册。
+
+        连续多次重连都收不到推送时降低重连频率（可能确实是店里没人说话，
+        也可能是别的登录端在抢），避免无意义地反复重连。
+        """
+        # 启动错峰：多账号同时重连容易触发平台风控
+        await self._interruptible_sleep(random.uniform(30, 90))
+        try:
+            while True:
+                try:
+                    from app.cookie_manager import manager as cookie_manager
+                    if cookie_manager and not cookie_manager.get_cookie_status(self.cookie_id):
+                        logger.info(f"【{self.cookie_id}】账号已禁用，停止入站推送看门狗")
+                        break
+
+                    threshold = self.inbound_silence_threshold
+                    if self._inbound_forced_reconnects >= self.inbound_silence_max_retries:
+                        threshold = self.inbound_silence_max_interval
+
+                    idle = time.time() - self.last_inbound_frame_time
+                    ws = self.ws
+                    if (
+                        idle >= threshold
+                        and self.connection_state == ConnectionState.CONNECTED
+                        and ws is not None
+                        and not getattr(ws, "closed", False)
+                    ):
+                        self._inbound_forced_reconnects += 1
+                        logger.warning(
+                            f"【{self.cookie_id}】已 {int(idle)} 秒没有收到任何闲鱼推送帧"
+                            f"（心跳正常），主动重连以恢复买家消息/自动发货推送"
+                            f"（第 {self._inbound_forced_reconnects} 次）"
+                        )
+                        await self._force_ws_reconnect("入站推送静默")
+                        # 给重连后的新会话一个完整的阈值窗口，避免连环重连
+                        self.last_inbound_frame_time = time.time()
+
+                    await self._interruptible_sleep(60)
+                except asyncio.CancelledError:
+                    logger.info(f"【{self.cookie_id}】入站推送看门狗收到取消信号，准备退出")
+                    raise
+                except Exception as e:
+                    logger.error(f"【{self.cookie_id}】入站推送看门狗异常: {self._safe_str(e)}")
+                    try:
+                        await self._interruptible_sleep(60)
+                    except asyncio.CancelledError:
+                        raise
+        except asyncio.CancelledError:
+            logger.info(f"【{self.cookie_id}】入站推送看门狗已取消，正在退出...")
+            raise
+        finally:
+            logger.info(f"【{self.cookie_id}】入站推送看门狗已退出")
+
     async def _execute_cookie_refresh(self, current_time):
         """独立执行Cookie刷新任务，避免阻塞主循环"""
 
@@ -8127,6 +8243,15 @@ class XianyuLive:
                     (not self.heartbeat_task or self.heartbeat_task.done())):
                     logger.info(f"【{self.cookie_id}】Cookie刷新完成，心跳任务正常运行")
                     self.heartbeat_task = asyncio.create_task(self.heartbeat_loop(self.ws))
+
+                # 浏览器刷 Cookie 时会带着账号 Cookie 打开闲鱼页面，平台可能把机器人
+                # 这条 IM 会话顶成「僵尸连接」（心跳正常但收不到任何推送）。刷完立刻
+                # 重连一次，用新 Cookie 重新 /reg，把推送通道抢回来。
+                if not self.restarted_in_browser_refresh:
+                    try:
+                        await self._force_ws_reconnect("浏览器刷 Cookie 结束")
+                    except asyncio.CancelledError:
+                        pass
 
                 # 清空消息接收标志，允许下次正常执行Cookie刷新
                 self.last_message_received_time = 0
@@ -8684,7 +8809,8 @@ class XianyuLive:
             await asyncio.sleep(0.1)
 
             # 访问指定页面获取真实cookie
-            target_url = "https://www.goofish.com/im"
+            # 同样不能用 /im，避免顶掉机器人的 IM 推送会话。
+            target_url = COOKIE_REFRESH_PAGE_URL
             logger.info(f"【{self.cookie_id}】访问页面获取真实cookie: {target_url}")
 
             # 使用更灵活的页面访问策略
@@ -8991,7 +9117,9 @@ class XianyuLive:
             await asyncio.sleep(0.1)
 
             # 访问指定页面
-            target_url = "https://www.goofish.com/im"
+            # 注意：这里不能用 /im（详见 COOKIE_REFRESH_PAGE_URL 的注释），
+            # 否则会把机器人自己的 IM 推送通道顶掉。
+            target_url = COOKIE_REFRESH_PAGE_URL
             logger.info(f"【{self.cookie_id}】访问页面: {target_url}")
 
             # 使用更灵活的页面访问策略
@@ -10591,6 +10719,8 @@ class XianyuLive:
                             self._set_connection_state(ConnectionState.CONNECTED, "初始化完成，连接就绪")
                             self.connection_failures = 0
                             self.last_successful_connection = time.time()
+                            # 刚重连完，重置入站看门狗计时，避免立刻又触发一次重连
+                            self.last_inbound_frame_time = time.time()
 
                             # 记录后台任务启动前的状态
                             logger.warning(f"【{self.cookie_id}】准备启动后台任务 - 当前状态: heartbeat={self.heartbeat_task}, token_refresh={self.token_refresh_task}, cleanup={self.cleanup_task}, cookie_refresh={self.cookie_refresh_task}")
@@ -10677,6 +10807,15 @@ class XianyuLive:
                             else:
                                 logger.info(f"【{self.cookie_id}】买家互动任务已在运行，跳过启动")
 
+                            # 启动入站推送看门狗：IM 会话被顶掉时不会报错，只会静默
+                            # 收不到消息，必须靠它发现并重连
+                            if not self.inbound_watchdog_task or self.inbound_watchdog_task.done():
+                                logger.info(f"【{self.cookie_id}】启动入站推送看门狗...")
+                                self.inbound_watchdog_task = asyncio.create_task(self.inbound_watchdog_loop())
+                                tasks_started.append("入站看门狗")
+                            else:
+                                logger.info(f"【{self.cookie_id}】入站推送看门狗已在运行，跳过启动")
+
                             # 记录所有后台任务状态
                             if tasks_started:
                                 logger.info(f"【{self.cookie_id}】✅ 新启动的任务: {', '.join(tasks_started)}")
@@ -10701,6 +10840,12 @@ class XianyuLive:
                                     # 处理心跳响应
                                     if await self.handle_heartbeat_response(message_data):
                                         continue
+
+                                    # 走到这里说明这是平台「主动推送」的帧（既不是心跳应答，
+                                    # 也不是我们自己 /r/ 请求的响应）。入站看门狗靠它判断推送
+                                    # 通道是否还活着，所以只有这类帧才重置计时。
+                                    self.last_inbound_frame_time = time.time()
+                                    self._inbound_forced_reconnects = 0
 
                                     # 处理其他消息
                                     # 使用追踪的异步任务处理消息，防止阻塞后续消息接收
@@ -10963,7 +11108,8 @@ class XianyuLive:
                 self.heartbeat_task and not self.heartbeat_task.done(),
                 self.token_refresh_task and not self.token_refresh_task.done(),
                 self.cleanup_task and not self.cleanup_task.done(),
-                self.cookie_refresh_task and not self.cookie_refresh_task.done()
+                self.cookie_refresh_task and not self.cookie_refresh_task.done(),
+                self.inbound_watchdog_task and not self.inbound_watchdog_task.done()
             ])
             
             if has_pending_tasks:
@@ -10984,6 +11130,7 @@ class XianyuLive:
                     self.token_refresh_task = None
                     self.cleanup_task = None
                     self.cookie_refresh_task = None
+                    self.inbound_watchdog_task = None
             else:
                 logger.info(f"【{self.cookie_id}】所有后台任务已清理完成，跳过重复清理")
                 # 确保任务引用被重置
@@ -10991,6 +11138,7 @@ class XianyuLive:
                 self.token_refresh_task = None
                 self.cleanup_task = None
                 self.cookie_refresh_task = None
+                self.inbound_watchdog_task = None
             
             # 清理所有后台任务
             if self.background_tasks:
