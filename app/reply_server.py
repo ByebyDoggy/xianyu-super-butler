@@ -6382,6 +6382,147 @@ async def test_ai_reply(cookie_id: str, test_data: dict,
         raise HTTPException(status_code=500, detail=f"服务器错误: {str(e)}")
 
 
+# ==================== AI 专属提示词（买家/商品级）与提示词预览 ====================
+
+class AIReplyOverrideIn(BaseModel):
+    """AI 专属覆盖规则。buyer_id / item_id 留空表示该维度不限制。"""
+    buyer_id: Optional[str] = ''
+    item_id: Optional[str] = ''
+    name: Optional[str] = ''
+    custom_prompts: Optional[str] = ''
+    knowledge: Optional[str] = ''
+    enabled: bool = True
+    priority: int = 0
+
+
+def _assert_account_owned(cookie_id: str, current_user: Dict[str, Any]) -> None:
+    """校验账号属于当前后台用户，避免越权读写别人账号的 AI 配置。"""
+    owned = db_manager.get_all_cookies(current_user['user_id'])
+    if cookie_id not in owned:
+        raise HTTPException(status_code=403, detail='无权限操作该账号')
+
+
+def _validate_override_body(body: AIReplyOverrideIn) -> None:
+    """两个字段至少要有一个：否则就是账号级配置，不该建成专属规则。"""
+    if not (body.buyer_id or '').strip() and not (body.item_id or '').strip():
+        raise HTTPException(
+            status_code=400,
+            detail='买家 ID 和商品 ID 至少要填一个；两个都不填就是账号级配置，请直接在上方账号设置里改',
+        )
+    if not (body.custom_prompts or '').strip() and not (body.knowledge or '').strip():
+        raise HTTPException(status_code=400, detail='专属提示词和专属知识至少要填一项')
+
+
+@app.get('/ai-reply-overrides/{cookie_id}')
+def list_ai_reply_overrides(cookie_id: str, current_user: Dict[str, Any] = Depends(get_current_user)):
+    """列出某账号的「买家/商品专属」提示词规则。"""
+    _assert_account_owned(cookie_id, current_user)
+    return db_manager.get_ai_reply_overrides(cookie_id, current_user['user_id'])
+
+
+@app.post('/ai-reply-overrides/{cookie_id}')
+def create_ai_reply_override(
+    cookie_id: str,
+    body: AIReplyOverrideIn,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """新增一条专属规则。"""
+    _assert_account_owned(cookie_id, current_user)
+    _validate_override_body(body)
+
+    override_id = db_manager.save_ai_reply_override(
+        cookie_id=cookie_id,
+        user_id=current_user['user_id'],
+        buyer_id=body.buyer_id,
+        item_id=body.item_id,
+        name=body.name,
+        custom_prompts=body.custom_prompts,
+        knowledge=body.knowledge,
+        enabled=body.enabled,
+        priority=body.priority,
+    )
+    if not override_id:
+        raise HTTPException(status_code=500, detail='保存失败')
+
+    log_with_user(
+        'info',
+        f"新增AI专属规则: 账号={cookie_id}, id={override_id}, "
+        f"买家={body.buyer_id or '不限'}, 商品={body.item_id or '不限'}",
+        current_user,
+    )
+    return {'success': True, 'id': override_id}
+
+
+@app.put('/ai-reply-overrides/{cookie_id}/{override_id}')
+def update_ai_reply_override(
+    cookie_id: str,
+    override_id: int,
+    body: AIReplyOverrideIn,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """更新一条专属规则。"""
+    _assert_account_owned(cookie_id, current_user)
+    _validate_override_body(body)
+
+    if not db_manager.get_ai_reply_override(override_id, cookie_id):
+        raise HTTPException(status_code=404, detail='规则不存在')
+
+    saved = db_manager.save_ai_reply_override(
+        cookie_id=cookie_id,
+        user_id=current_user['user_id'],
+        buyer_id=body.buyer_id,
+        item_id=body.item_id,
+        name=body.name,
+        custom_prompts=body.custom_prompts,
+        knowledge=body.knowledge,
+        enabled=body.enabled,
+        priority=body.priority,
+        override_id=override_id,
+    )
+    if not saved:
+        raise HTTPException(status_code=500, detail='保存失败')
+    return {'success': True, 'id': override_id}
+
+
+@app.delete('/ai-reply-overrides/{cookie_id}/{override_id}')
+def delete_ai_reply_override(
+    cookie_id: str,
+    override_id: int,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """删除一条专属规则。"""
+    _assert_account_owned(cookie_id, current_user)
+    if not db_manager.delete_ai_reply_override(override_id, cookie_id):
+        raise HTTPException(status_code=404, detail='规则不存在')
+    log_with_user('info', f"删除AI专属规则: 账号={cookie_id}, id={override_id}", current_user)
+    return {'success': True}
+
+
+@app.post('/ai-reply-preview/{cookie_id}')
+def preview_ai_reply_prompt(
+    cookie_id: str,
+    body: Optional[Dict[str, Any]] = None,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """预览最终会发给模型的提示词（不调用模型、不花钱、不计费）。
+
+    拼装逻辑与真实回复共用，所以这里看到的就是实际会发出去的内容。
+    """
+    _assert_account_owned(cookie_id, current_user)
+    payload = body or {}
+
+    preview = ai_reply_engine.build_prompt_preview(
+        cookie_id=cookie_id,
+        message=str(payload.get('message') or ''),
+        intent=(str(payload.get('intent')).strip() if payload.get('intent') else None),
+        item_id=str(payload.get('item_id') or ''),
+        buyer_id=str(payload.get('buyer_id') or ''),
+        chat_id=str(payload.get('chat_id') or ''),
+        include_history=bool(payload.get('include_history', True)),
+    )
+    return preview
+
+
 # ==================== 日志管理API ====================
 
 @app.get("/logs")

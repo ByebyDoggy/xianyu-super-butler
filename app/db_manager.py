@@ -248,6 +248,32 @@ class DBManager:
             )
             ''')
 
+            # 创建AI回复的「买家/商品专属」覆盖规则表。
+            # 需求：不同的「买家-商品」组合可以有自己的提示词/知识，提高客服回复效果。
+            # buyer_id / item_id 为空表示「不限」，两者都为空就是账号级兜底；
+            # 命中时按「限制条件越具体越优先」选一条，细则见 find_ai_reply_override。
+            cursor.execute('''
+            CREATE TABLE IF NOT EXISTS ai_reply_overrides (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                cookie_id TEXT NOT NULL,
+                buyer_id TEXT,
+                item_id TEXT,
+                name TEXT,
+                custom_prompts TEXT,
+                knowledge TEXT,
+                enabled BOOLEAN DEFAULT TRUE,
+                priority INTEGER DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            ''')
+
+            cursor.execute('''
+            CREATE INDEX IF NOT EXISTS idx_ai_reply_overrides_lookup
+            ON ai_reply_overrides (cookie_id, enabled)
+            ''')
+
             # 创建AI商品信息缓存表
             cursor.execute('''
             CREATE TABLE IF NOT EXISTS ai_item_cache (
@@ -2717,6 +2743,174 @@ class DBManager:
             except Exception as e:
                 logger.error(f"获取账号AI API Key失败: {e}")
                 return ''
+
+    # ==================== AI 回复的「买家/商品专属」覆盖规则 ====================
+    #
+    # 需求背景：同一个账号下，不同买家、不同商品要用的提示词/知识是不一样的。
+    # 例如「老客户+某商品」可以更优惠、更放松，而「陌生买家」要更克制。
+    #
+    # 一条规则里 buyer_id / item_id 为空 = 该维度不限，因此：
+    #   两者都有值 → 只对「这个买家的这个商品」生效（最具体）
+    #   只有一个有值 → 对该买家（或该商品）所有情况生效
+    #   两者都空     → 账号级兜底
+    # 命中多条时按「限制维度越多越优先，其次 priority 越大越优先」取一条。
+
+    _AI_OVERRIDE_COLUMNS = (
+        'id, user_id, cookie_id, buyer_id, item_id, name, custom_prompts, '
+        'knowledge, enabled, priority, created_at, updated_at'
+    )
+
+    def _row_to_ai_override(self, row) -> dict:
+        return {
+            'id': row[0],
+            'user_id': row[1],
+            'cookie_id': row[2],
+            'buyer_id': row[3] or '',
+            'item_id': row[4] or '',
+            'name': row[5] or '',
+            'custom_prompts': row[6] or '',
+            'knowledge': row[7] or '',
+            'enabled': bool(row[8]),
+            'priority': row[9] or 0,
+            'created_at': row[10],
+            'updated_at': row[11],
+        }
+
+    def get_ai_reply_overrides(self, cookie_id: str, user_id: int = None) -> List[Dict[str, Any]]:
+        """列出某账号的专属覆盖规则（管理界面用）。"""
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                sql = f'SELECT {self._AI_OVERRIDE_COLUMNS} FROM ai_reply_overrides WHERE cookie_id = ?'
+                params: List[Any] = [cookie_id]
+                if user_id is not None:
+                    sql += ' AND user_id = ?'
+                    params.append(user_id)
+                sql += ' ORDER BY priority DESC, id DESC'
+                cursor.execute(sql, params)
+                return [self._row_to_ai_override(row) for row in cursor.fetchall()]
+            except Exception as e:
+                logger.error(f"获取AI专属提示词规则失败: {e}")
+                return []
+
+    def get_ai_reply_override(self, override_id: int, cookie_id: str = None) -> Optional[Dict[str, Any]]:
+        """按 ID 取一条规则。带 cookie_id 时顺带做归属校验。"""
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                sql = f'SELECT {self._AI_OVERRIDE_COLUMNS} FROM ai_reply_overrides WHERE id = ?'
+                params: List[Any] = [override_id]
+                if cookie_id is not None:
+                    sql += ' AND cookie_id = ?'
+                    params.append(cookie_id)
+                cursor.execute(sql, params)
+                row = cursor.fetchone()
+                return self._row_to_ai_override(row) if row else None
+            except Exception as e:
+                logger.error(f"获取AI专属提示词规则失败: {e}")
+                return None
+
+    def save_ai_reply_override(
+        self,
+        cookie_id: str,
+        user_id: int,
+        buyer_id: str = '',
+        item_id: str = '',
+        name: str = '',
+        custom_prompts: str = '',
+        knowledge: str = '',
+        enabled: bool = True,
+        priority: int = 0,
+        override_id: int = None,
+    ) -> Optional[int]:
+        """新增或更新一条规则，返回规则 ID。"""
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                buyer_value = (buyer_id or '').strip() or None
+                item_value = (item_id or '').strip() or None
+                if override_id:
+                    cursor.execute(
+                        '''
+                        UPDATE ai_reply_overrides
+                        SET buyer_id = ?, item_id = ?, name = ?, custom_prompts = ?,
+                            knowledge = ?, enabled = ?, priority = ?,
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE id = ? AND cookie_id = ?
+                        ''',
+                        (
+                            buyer_value, item_value, name, custom_prompts, knowledge,
+                            1 if enabled else 0, int(priority or 0),
+                            override_id, cookie_id,
+                        ),
+                    )
+                    return override_id if cursor.rowcount else None
+
+                cursor.execute(
+                    '''
+                    INSERT INTO ai_reply_overrides
+                    (user_id, cookie_id, buyer_id, item_id, name, custom_prompts,
+                     knowledge, enabled, priority)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ''',
+                    (
+                        user_id, cookie_id, buyer_value, item_value, name,
+                        custom_prompts, knowledge, 1 if enabled else 0, int(priority or 0),
+                    ),
+                )
+                return cursor.lastrowid
+            except Exception as e:
+                logger.error(f"保存AI专属提示词规则失败: {e}")
+                return None
+
+    def delete_ai_reply_override(self, override_id: int, cookie_id: str = None) -> bool:
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                if cookie_id is not None:
+                    cursor.execute(
+                        'DELETE FROM ai_reply_overrides WHERE id = ? AND cookie_id = ?',
+                        (override_id, cookie_id),
+                    )
+                else:
+                    cursor.execute('DELETE FROM ai_reply_overrides WHERE id = ?', (override_id,))
+                return cursor.rowcount > 0
+            except Exception as e:
+                logger.error(f"删除AI专属提示词规则失败: {e}")
+                return False
+
+    def find_ai_reply_override(
+        self, cookie_id: str, buyer_id: str = '', item_id: str = ''
+    ) -> Optional[Dict[str, Any]]:
+        """按「买家-商品」找一个最匹配的规则（AI 回复时调用）。
+
+        buyer_id / item_id 为空的规则视为「不限」；多命中时限制维度越多越优先，
+        同维度数再比 priority。所以「这个买家+这个商品」> 「这个商品」> 「账号级」。
+        """
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute(
+                    f'''
+                    SELECT {self._AI_OVERRIDE_COLUMNS}
+                    FROM ai_reply_overrides
+                    WHERE cookie_id = ? AND enabled = 1
+                      AND (buyer_id IS NULL OR buyer_id = '' OR buyer_id = ?)
+                      AND (item_id IS NULL OR item_id = '' OR item_id = ?)
+                    ORDER BY
+                      (CASE WHEN buyer_id IS NOT NULL AND buyer_id != '' THEN 1 ELSE 0 END
+                       + CASE WHEN item_id IS NOT NULL AND item_id != '' THEN 1 ELSE 0 END) DESC,
+                      priority DESC,
+                      id DESC
+                    LIMIT 1
+                    ''',
+                    (cookie_id, (buyer_id or '').strip(), (item_id or '').strip()),
+                )
+                row = cursor.fetchone()
+                return self._row_to_ai_override(row) if row else None
+            except Exception as e:
+                logger.error(f"查找AI专属提示词规则失败: {e}")
+                return None
 
     def get_all_ai_reply_settings(self) -> Dict[str, dict]:
         """获取所有账号的AI回复设置"""

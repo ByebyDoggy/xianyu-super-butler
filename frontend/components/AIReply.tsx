@@ -1,24 +1,36 @@
 import React, { useEffect, useMemo, useState } from 'react';
+import { createPortal } from 'react-dom';
 import {
   Bot,
   CheckCircle2,
   Eye,
   EyeOff,
   ExternalLink,
+  Layers,
   Loader2,
   MessageSquareText,
+  Pencil,
   Play,
+  Plus,
   Save,
   ShieldCheck,
+  Trash2,
+  UserRound,
+  X,
 } from 'lucide-react';
-import { AccountDetail, AIReplySettings } from '../types';
+import { AccountDetail, AIReplySettings, AIReplyOverride, AIReplyPromptPreview } from '../types';
 import {
+  createAIReplyOverride,
+  deleteAIReplyOverride,
   getAccountAISettings,
   getAccountDetails,
+  getAIReplyOverrides,
+  previewAIReplyPrompt,
   testAIConnection,
   updateAccountAISettings,
+  updateAIReplyOverride,
 } from '../services/api';
-import { notify } from '../services/feedback';
+import { confirmAction, notify } from '../services/feedback';
 import { EmptyState, PageHeader, PageLoading, SectionHeader } from './ui';
 
 // 自建中转，兼容 OpenAI 接口，每天可领免费额度，省去用户自己找服务商配密钥。
@@ -52,6 +64,30 @@ const AIReply: React.FC = () => {
   const [testMessage, setTestMessage] = useState('你好，这个商品现在还能买吗？');
   const [testReply, setTestReply] = useState('');
 
+  // 提示词预览：不调用模型，只把最终拼出来的结构展示出来
+  const [previewing, setPreviewing] = useState(false);
+  const [preview, setPreview] = useState<AIReplyPromptPreview | null>(null);
+  const [previewIntent, setPreviewIntent] = useState('');
+  const [previewMessage, setPreviewMessage] = useState('能便宜点吗？');
+  const [previewBuyerId, setPreviewBuyerId] = useState('');
+  const [previewItemId, setPreviewItemId] = useState('');
+  const [showAllMessages, setShowAllMessages] = useState(false);
+
+  // 买家/商品专属规则
+  const [overrides, setOverrides] = useState<AIReplyOverride[]>([]);
+  const [overrideModalOpen, setOverrideModalOpen] = useState(false);
+  const [editingOverrideId, setEditingOverrideId] = useState<number | null>(null);
+  const [savingOverride, setSavingOverride] = useState(false);
+  const [overrideForm, setOverrideForm] = useState({
+    buyer_id: '',
+    item_id: '',
+    name: '',
+    custom_prompts: '',
+    knowledge: '',
+    priority: 0,
+    enabled: true,
+  });
+
   const selectedAccount = useMemo(
     () => accounts.find(account => account.id === selectedAccountId),
     [accounts, selectedAccountId],
@@ -72,10 +108,22 @@ const AIReply: React.FC = () => {
     setLoading(true);
     setTestReply('');
     setShowApiKey(false);
+    setPreview(null);
     getAccountAISettings(selectedAccountId)
       .then(data => setSettings({ ...defaultSettings, ...data, api_key: '' }))
       .catch(error => notify(error instanceof Error ? error.message : 'AI配置加载失败', 'error'))
       .finally(() => setLoading(false));
+  }, [selectedAccountId]);
+
+  // 切账号时重新拉专属规则
+  useEffect(() => {
+    if (!selectedAccountId) {
+      setOverrides([]);
+      return;
+    }
+    getAIReplyOverrides(selectedAccountId)
+      .then(list => setOverrides(Array.isArray(list) ? list : []))
+      .catch(() => setOverrides([]));
   }, [selectedAccountId]);
 
   const updateSetting = <K extends keyof AIReplySettings>(key: K, value: AIReplySettings[K]) => {
@@ -102,6 +150,107 @@ const AIReply: React.FC = () => {
       notify(error instanceof Error ? error.message : 'AI配置保存失败', 'error');
     } finally {
       setSaving(false);
+    }
+  };
+
+  const reloadOverrides = async () => {
+    if (!selectedAccountId) return;
+    try {
+      const list = await getAIReplyOverrides(selectedAccountId);
+      setOverrides(Array.isArray(list) ? list : []);
+    } catch {
+      /* 列表拉不到不影响其它操作 */
+    }
+  };
+
+  const handlePreview = async () => {
+    if (!selectedAccountId) {
+      notify('请先选择账号', 'warning');
+      return;
+    }
+    setPreviewing(true);
+    try {
+      const result = await previewAIReplyPrompt(selectedAccountId, {
+        message: previewMessage.trim(),
+        intent: previewIntent || undefined,
+        buyer_id: previewBuyerId.trim() || undefined,
+        item_id: previewItemId.trim() || undefined,
+      });
+      setPreview(result);
+      setShowAllMessages(false);
+    } catch (error) {
+      notify(error instanceof Error ? error.message : '提示词预览失败', 'error');
+    } finally {
+      setPreviewing(false);
+    }
+  };
+
+  const openOverrideModal = (override?: AIReplyOverride) => {
+    if (override) {
+      setEditingOverrideId(override.id);
+      setOverrideForm({
+        buyer_id: override.buyer_id || '',
+        item_id: override.item_id || '',
+        name: override.name || '',
+        custom_prompts: override.custom_prompts || '',
+        knowledge: override.knowledge || '',
+        priority: override.priority || 0,
+        enabled: override.enabled !== false,
+      });
+    } else {
+      setEditingOverrideId(null);
+      setOverrideForm({
+        buyer_id: previewBuyerId.trim(),
+        item_id: previewItemId.trim(),
+        name: '',
+        custom_prompts: '',
+        knowledge: '',
+        priority: 0,
+        enabled: true,
+      });
+    }
+    setOverrideModalOpen(true);
+  };
+
+  const handleSaveOverride = async () => {
+    if (!selectedAccountId) return;
+    if (!overrideForm.buyer_id.trim() && !overrideForm.item_id.trim()) {
+      notify('买家 ID 和商品 ID 至少要填一个', 'warning');
+      return;
+    }
+    if (!overrideForm.custom_prompts.trim() && !overrideForm.knowledge.trim()) {
+      notify('专属提示词和专属知识至少要填一项', 'warning');
+      return;
+    }
+    setSavingOverride(true);
+    try {
+      if (editingOverrideId) {
+        await updateAIReplyOverride(selectedAccountId, editingOverrideId, overrideForm);
+        notify('专属规则已更新', 'success');
+      } else {
+        await createAIReplyOverride(selectedAccountId, overrideForm);
+        notify('专属规则已新增', 'success');
+      }
+      setOverrideModalOpen(false);
+      await reloadOverrides();
+    } catch (error) {
+      notify(error instanceof Error ? error.message : '保存失败', 'error');
+    } finally {
+      setSavingOverride(false);
+    }
+  };
+
+  const handleDeleteOverride = async (override: AIReplyOverride) => {
+    if (!selectedAccountId) return;
+    if (!(await confirmAction(`确认删除规则「${override.name || override.item_id || override.buyer_id}」？`))) {
+      return;
+    }
+    try {
+      await deleteAIReplyOverride(selectedAccountId, override.id);
+      notify('已删除', 'success');
+      await reloadOverrides();
+    } catch (error) {
+      notify(error instanceof Error ? error.message : '删除失败', 'error');
     }
   };
 
@@ -389,6 +538,254 @@ const AIReply: React.FC = () => {
                   </p>
                 </div>
               </section>
+
+              <section className="section-panel">
+                <SectionHeader
+                  title="系统提示词预览"
+                  description="看一眼最终发给模型的结构：角色设定 + 商品事实 + 议价设置 + 安全边界。预览不调用模型，不消耗额度。"
+                  icon={Layers}
+                />
+                <div className="grid gap-4 p-5">
+                  <div className="grid gap-3 sm:grid-cols-4">
+                    <label>
+                      <span className="mb-1.5 block text-sm font-semibold text-gray-700">意图</span>
+                      <select
+                        value={previewIntent}
+                        onChange={event => setPreviewIntent(event.target.value)}
+                        className="ios-input w-full rounded-md px-3 py-2.5 text-sm"
+                      >
+                        <option value="">自动判断</option>
+                        {(preview?.intent_options || ['price', 'tech', 'default']).map(option => (
+                          <option key={option} value={option}>
+                            {option === 'price' ? '议价（price）' : option === 'tech' ? '技术（tech）' : `通用（${option}）`}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                    <label className="sm:col-span-3">
+                      <span className="mb-1.5 block text-sm font-semibold text-gray-700">模拟买家消息</span>
+                      <input
+                        value={previewMessage}
+                        onChange={event => setPreviewMessage(event.target.value)}
+                        className="ios-input w-full rounded-md px-3 py-2.5 text-sm"
+                      />
+                    </label>
+                    <label className="sm:col-span-2">
+                      <span className="mb-1.5 block text-sm font-semibold text-gray-700">买家 ID（可选）</span>
+                      <input
+                        value={previewBuyerId}
+                        onChange={event => setPreviewBuyerId(event.target.value)}
+                        placeholder="用于验证买家级规则是否命中"
+                        className="ios-input w-full rounded-md px-3 py-2.5 text-sm"
+                      />
+                    </label>
+                    <label>
+                      <span className="mb-1.5 block text-sm font-semibold text-gray-700">商品 ID（可选）</span>
+                      <input
+                        value={previewItemId}
+                        onChange={event => setPreviewItemId(event.target.value)}
+                        placeholder="会自动带出商品事实"
+                        className="ios-input w-full rounded-md px-3 py-2.5 text-sm"
+                      />
+                    </label>
+                    <div className="flex items-end">
+                      <button
+                        type="button"
+                        onClick={handlePreview}
+                        disabled={previewing}
+                        className="ios-btn-secondary flex w-full items-center justify-center gap-2 rounded-md px-4 py-2.5 text-sm"
+                      >
+                        {previewing ? <Loader2 className="h-4 w-4 animate-spin" /> : <Layers className="h-4 w-4" />}
+                        生成预览
+                      </button>
+                    </div>
+                  </div>
+
+                  {preview && (
+                    <div className="space-y-3">
+                      <div className="flex flex-wrap items-center gap-2 text-xs">
+                        <span className={`status-badge ${preview.ai_enabled ? 'status-badge-success' : 'status-badge-warning'}`}>
+                          {preview.ai_enabled ? 'AI 已启用' : 'AI 未启用'}
+                        </span>
+                        <span className="status-badge status-badge-info">模型 {preview.model_name || '-'}</span>
+                        <span className="status-badge status-badge-info">意图 {preview.intent}</span>
+                        <span className="status-badge status-badge-info">上下文 {preview.context_message_count} 条</span>
+                        {preview.override ? (
+                          <span className="status-badge bg-emerald-100 text-emerald-800">
+                            命中专属规则：{preview.override.name || '（未命名）'}
+                            （买家 {preview.override.buyer_id || '不限'} / 商品 {preview.override.item_id || '不限'}；
+                            {preview.override.used_custom_prompts ? '提示词已覆盖' : '提示词用账号级'}；
+                            知识 {preview.override.knowledge_chars} 字）
+                          </span>
+                        ) : (
+                          <span className="status-badge bg-gray-100 text-gray-600">未命中专属规则，使用账号级配置</span>
+                        )}
+                      </div>
+
+                      <div>
+                        <div className="flex items-center justify-between gap-2">
+                          <span className="text-sm font-semibold text-gray-700">
+                            system 消息（角色设定 + 商品事实 + 议价设置 + 安全边界）
+                          </span>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              void navigator.clipboard?.writeText(preview.system_message);
+                              notify('已复制 system 消息', 'success');
+                            }}
+                            className="shrink-0 rounded-md px-2 py-1 text-xs font-bold text-blue-600 hover:bg-blue-50"
+                          >
+                            复制
+                          </button>
+                        </div>
+                        <pre className="mt-2 max-h-80 overflow-auto whitespace-pre-wrap break-words rounded-md bg-gray-900 px-3 py-2.5 font-mono text-[11px] leading-5 text-gray-100">
+{preview.system_message}
+                        </pre>
+                      </div>
+
+                      <div>
+                        <button
+                          type="button"
+                          onClick={() => setShowAllMessages(value => !value)}
+                          className="text-xs font-bold text-blue-600 hover:underline"
+                        >
+                          {showAllMessages ? '收起' : '查看'}完整 messages（{preview.messages.length} 条）
+                        </button>
+                        {showAllMessages && (
+                          <ol className="mt-2 space-y-2">
+                            {preview.messages.map((msg, index) => (
+                              <li key={`${msg.role}-${index}`}>
+                                <span className="status-badge status-badge-info">{msg.role}</span>
+                                <pre className="mt-1 max-h-52 overflow-auto whitespace-pre-wrap break-words rounded-md bg-gray-50 px-3 py-2 font-mono text-[11px] leading-5 text-gray-700">
+{msg.content}
+                                </pre>
+                              </li>
+                            ))}
+                          </ol>
+                        )}
+                      </div>
+
+                      <details className="rounded-md border border-gray-200 bg-gray-50 px-3 py-2">
+                        <summary className="cursor-pointer text-xs font-bold text-gray-700">
+                          内置默认提示词与账号级配置（只读，用于对照）
+                        </summary>
+                        <div className="mt-2 space-y-2 text-xs">
+                          <div>
+                            <span className="font-semibold text-gray-700">账号级「回复风格与业务规则」：</span>
+                            <pre className="mt-1 whitespace-pre-wrap break-words font-mono text-[11px] text-gray-600">
+{preview.account_custom_prompts || '（未填写，使用内置默认提示词）'}
+                            </pre>
+                          </div>
+                          {Object.entries(preview.default_prompts || {})
+                            .filter(([key]) => preview.intent_options.includes(key))
+                            .map(([key, value]) => (
+                              <div key={key}>
+                                <span className="font-semibold text-gray-700">内置默认（{key}）：</span>
+                                <pre className="mt-1 whitespace-pre-wrap break-words font-mono text-[11px] text-gray-600">{value}</pre>
+                              </div>
+                            ))}
+                        </div>
+                      </details>
+
+                      <p className="text-xs leading-5 text-gray-500">
+                        拼装逻辑与真实回复完全共用，所以这里看到的就是实际会发给模型的内容
+                        （预览不包含尚未发生的模型回复）。
+                      </p>
+                    </div>
+                  )}
+                </div>
+              </section>
+
+              <section className="section-panel">
+                <SectionHeader
+                  title="买家 / 商品专属提示词"
+                  description="给「某个买家的某个商品」单独设定提示词与知识，命中时优先于账号级配置。"
+                  icon={UserRound}
+                  actions={(
+                    <button
+                      type="button"
+                      onClick={() => openOverrideModal()}
+                      className="ios-btn-primary flex items-center gap-2 rounded-md px-3 py-2 text-xs"
+                    >
+                      <Plus className="h-3.5 w-3.5" />
+                      新增规则
+                    </button>
+                  )}
+                />
+                <div className="p-5">
+                  <p className="mb-3 text-xs leading-5 text-gray-500">
+                    匹配优先级：买家+商品（最具体） &gt; 只限买家 / 只限商品 &gt; 都不限（等同账号级）；
+                    同样命中时比较「优先级」，数值大的生效。留空的维度表示「不限」。
+                  </p>
+
+                  {overrides.length === 0 ? (
+                    <EmptyState
+                      compact
+                      title="暂无专属规则"
+                      description="例如：给老客户单独放宽松的议价口径，或给某个商品补充专用知识。"
+                      icon={UserRound}
+                    />
+                  ) : (
+                    <div className="overflow-x-auto">
+                      <table className="w-full text-sm">
+                        <thead>
+                          <tr className="border-b border-gray-200 text-left text-xs text-gray-500">
+                            <th className="py-2 pr-3">名称</th>
+                            <th className="py-2 pr-3">买家 ID</th>
+                            <th className="py-2 pr-3">商品 ID</th>
+                            <th className="py-2 pr-3">专属提示词</th>
+                            <th className="py-2 pr-3">专属知识</th>
+                            <th className="py-2 pr-3">优先级</th>
+                            <th className="py-2 pr-3">状态</th>
+                            <th className="py-2">操作</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {overrides.map(override => (
+                            <tr key={override.id} className="border-b border-gray-100">
+                              <td className="py-2 pr-3 font-semibold text-gray-800">{override.name || '-'}</td>
+                              <td className="py-2 pr-3 font-mono text-xs text-gray-600">{override.buyer_id || '不限'}</td>
+                              <td className="py-2 pr-3 font-mono text-xs text-gray-600">{override.item_id || '不限'}</td>
+                              <td className="py-2 pr-3 text-xs text-gray-600">
+                                {override.custom_prompts ? `${override.custom_prompts.length} 字` : '（用账号级）'}
+                              </td>
+                              <td className="py-2 pr-3 text-xs text-gray-600">
+                                {override.knowledge ? `${override.knowledge.length} 字` : '-'}
+                              </td>
+                              <td className="py-2 pr-3 text-xs text-gray-600">{override.priority || 0}</td>
+                              <td className="py-2 pr-3">
+                                <span className={`status-badge ${override.enabled ? 'status-badge-success' : 'bg-gray-100 text-gray-500'}`}>
+                                  {override.enabled ? '启用' : '停用'}
+                                </span>
+                              </td>
+                              <td className="py-2">
+                                <div className="flex items-center gap-1">
+                                  <button
+                                    type="button"
+                                    onClick={() => openOverrideModal(override)}
+                                    title="编辑"
+                                    className="rounded-md p-1.5 text-gray-500 hover:bg-gray-100"
+                                  >
+                                    <Pencil className="h-3.5 w-3.5" />
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={() => handleDeleteOverride(override)}
+                                    title="删除"
+                                    className="rounded-md p-1.5 text-red-500 hover:bg-red-50"
+                                  >
+                                    <Trash2 className="h-3.5 w-3.5" />
+                                  </button>
+                                </div>
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  )}
+                </div>
+              </section>
             </div>
 
             <aside className="space-y-5">
@@ -436,6 +833,126 @@ const AIReply: React.FC = () => {
           </div>
 
         </>
+      )}
+
+      {overrideModalOpen && createPortal(
+        <div className="modal-overlay">
+          <div className="modal-container" style={{ maxWidth: '40rem' }}>
+            <div className="modal-header flex items-start justify-between gap-4">
+              <div>
+                <h3 className="text-lg font-bold text-gray-900">
+                  {editingOverrideId ? '编辑专属规则' : '新增专属规则'}
+                </h3>
+                <p className="mt-1 text-xs text-gray-500">
+                  买家 ID 与商品 ID 至少要填一个；留空的那一维表示「不限」。
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setOverrideModalOpen(false)}
+                className="shrink-0 rounded-md p-2 hover:bg-gray-100"
+                aria-label="关闭"
+              >
+                <X className="h-5 w-5 text-gray-500" />
+              </button>
+            </div>
+
+            <div className="modal-body space-y-4">
+              <div className="grid gap-3 sm:grid-cols-2">
+                <label>
+                  <span className="mb-1.5 block text-sm font-semibold text-gray-700">买家 ID</span>
+                  <input
+                    value={overrideForm.buyer_id}
+                    onChange={event => setOverrideForm({ ...overrideForm, buyer_id: event.target.value })}
+                    placeholder="留空 = 不限买家"
+                    className="ios-input w-full rounded-md px-3 py-2.5 text-sm"
+                  />
+                </label>
+                <label>
+                  <span className="mb-1.5 block text-sm font-semibold text-gray-700">商品 ID</span>
+                  <input
+                    value={overrideForm.item_id}
+                    onChange={event => setOverrideForm({ ...overrideForm, item_id: event.target.value })}
+                    placeholder="留空 = 不限商品"
+                    className="ios-input w-full rounded-md px-3 py-2.5 text-sm"
+                  />
+                </label>
+                <label>
+                  <span className="mb-1.5 block text-sm font-semibold text-gray-700">规则名称（便于识别）</span>
+                  <input
+                    value={overrideForm.name}
+                    onChange={event => setOverrideForm({ ...overrideForm, name: event.target.value })}
+                    placeholder="例如：老客户-某商品"
+                    className="ios-input w-full rounded-md px-3 py-2.5 text-sm"
+                  />
+                </label>
+                <label>
+                  <span className="mb-1.5 block text-sm font-semibold text-gray-700">优先级</span>
+                  <input
+                    type="number"
+                    value={overrideForm.priority}
+                    onChange={event => setOverrideForm({ ...overrideForm, priority: Number(event.target.value) })}
+                    className="ios-input w-full rounded-md px-3 py-2.5 text-sm"
+                  />
+                </label>
+              </div>
+
+              <label className="block">
+                <span className="mb-1.5 block text-sm font-semibold text-gray-700">
+                  专属提示词（留空则继续用账号级的「回复风格与业务规则」）
+                </span>
+                <textarea
+                  value={overrideForm.custom_prompts}
+                  onChange={event => setOverrideForm({ ...overrideForm, custom_prompts: event.target.value })}
+                  className="ios-input min-h-28 w-full resize-y rounded-md px-3 py-2.5 text-sm leading-6"
+                  placeholder="例如：这位买家是老客户，语气亲切，可在授权范围内主动给出小优惠。"
+                />
+              </label>
+
+              <label className="block">
+                <span className="mb-1.5 block text-sm font-semibold text-gray-700">
+                  专属知识（会以「额外知识」小节追加到系统提示词，不覆盖角色设定）
+                </span>
+                <textarea
+                  value={overrideForm.knowledge}
+                  onChange={event => setOverrideForm({ ...overrideForm, knowledge: event.target.value })}
+                  className="ios-input min-h-28 w-full resize-y rounded-md px-3 py-2.5 text-sm leading-6"
+                  placeholder="例如：该买家已复购 3 次，历史订单均可正常发货；该商品为虚拟卡密，不支持无理由退款。"
+                />
+              </label>
+
+              <label className="flex items-center justify-between gap-4">
+                <span className="text-sm font-semibold text-gray-700">启用这条规则</span>
+                <input
+                  type="checkbox"
+                  checked={overrideForm.enabled}
+                  onChange={event => setOverrideForm({ ...overrideForm, enabled: event.target.checked })}
+                  className="h-5 w-5 shrink-0 accent-yellow-400"
+                />
+              </label>
+            </div>
+
+            <div className="modal-footer flex justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => setOverrideModalOpen(false)}
+                className="ios-btn-secondary rounded-md px-4 py-2.5 text-sm"
+              >
+                取消
+              </button>
+              <button
+                type="button"
+                onClick={handleSaveOverride}
+                disabled={savingOverride}
+                className="ios-btn-primary flex items-center gap-2 rounded-md px-4 py-2.5 text-sm"
+              >
+                {savingOverride ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}
+                保存
+              </button>
+            </div>
+          </div>
+        </div>,
+        document.body,
       )}
     </div>
   );

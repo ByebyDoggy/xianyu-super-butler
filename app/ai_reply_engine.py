@@ -360,22 +360,122 @@ class AIReplyEngine:
             raise last_exc
         return None
 
-    def _resolve_system_prompt(self, raw_prompts: str, intent: str) -> str:
-        """兼容旧版 JSON 提示词和新版纯文本风格说明。"""
-        base_prompt = self.default_prompts.get(intent, self.default_prompts['default'])
-        if not raw_prompts or not raw_prompts.strip():
-            return base_prompt
+    def _resolve_system_prompt(self, raw_prompts: str, intent: str, knowledge: str = '') -> str:
+        """兼容旧版 JSON 提示词和新版纯文本风格说明。
 
-        try:
-            parsed = json.loads(raw_prompts)
-        except (TypeError, json.JSONDecodeError):
-            return f"{base_prompt}\n\n卖家补充规则：\n{raw_prompts.strip()}"
+        knowledge（专属知识）始终以独立小节追加，不参与「覆盖要不要替换默认提示词」
+        的判断 —— 知识是补充事实，不是角色设定。
+        """
+        prompt = self.default_prompts.get(intent, self.default_prompts['default'])
 
-        if isinstance(parsed, dict):
-            selected = parsed.get(intent) or parsed.get('default')
-            if isinstance(selected, str) and selected.strip():
-                return selected.strip()
-        return base_prompt
+        if raw_prompts and raw_prompts.strip():
+            base_prompt = prompt
+            try:
+                parsed = json.loads(raw_prompts)
+            except (TypeError, json.JSONDecodeError):
+                # 纯文本：作为「卖家补充规则」追加在默认角色设定之后
+                prompt = f"{base_prompt}\n\n卖家补充规则：\n{raw_prompts.strip()}"
+            else:
+                # JSON：按意图取值，取到就整体替换默认角色设定
+                if isinstance(parsed, dict):
+                    selected = parsed.get(intent) or parsed.get('default')
+                    if isinstance(selected, str) and selected.strip():
+                        prompt = selected.strip()
+
+        if knowledge and knowledge.strip():
+            prompt = f"{prompt}\n\n额外知识（优先依据这些事实回答）：\n{knowledge.strip()}"
+
+        return prompt
+
+    def _compose_prompt_parts(
+        self,
+        settings: dict,
+        intent: str,
+        item_info: dict,
+        message: str,
+        context: list,
+        bargain_count: int,
+        override: Optional[dict] = None,
+    ) -> dict:
+        """把「系统提示词 + 安全边界 + 历史上下文 + 当前消息」拼成最终 messages。
+
+        生成回复与前端「提示词预览」共用这一段 —— 预览要是另写一份拼装逻辑，
+        迟早会和真实调用不一致，那预览就没意义了。
+
+        专属规则（买家/商品级）的优先级：
+        - custom_prompts：专属规则里写了就覆盖账号级；没写则回落到账号级
+        - knowledge：专属知识始终追加（账号级没有 knowledge 字段）
+        """
+        item_info = item_info or {}
+        raw_prompts = settings.get('custom_prompts', '') or ''
+        knowledge = ''
+        override_info = None
+
+        if override:
+            override_prompts = (override.get('custom_prompts') or '').strip()
+            if override_prompts:
+                raw_prompts = override_prompts
+            knowledge = (override.get('knowledge') or '').strip()
+            override_info = {
+                'id': override.get('id'),
+                'name': override.get('name') or '',
+                'buyer_id': override.get('buyer_id') or '',
+                'item_id': override.get('item_id') or '',
+                'priority': override.get('priority') or 0,
+                'used_custom_prompts': bool(override_prompts),
+                'knowledge_chars': len(knowledge),
+            }
+
+        system_prompt = self._resolve_system_prompt(raw_prompts, intent, knowledge)
+
+        item_desc = f"商品标题: {item_info.get('title', '未知')}\n"
+        item_desc += f"商品价格: {item_info.get('price', '未知')}元\n"
+        item_desc += f"商品描述: {item_info.get('desc', '无')}"
+
+        max_bargain_rounds = settings.get('max_bargain_rounds', 3)
+        max_discount_percent = settings.get('max_discount_percent', 10)
+        max_discount_amount = settings.get('max_discount_amount', 100)
+
+        safety_prompt = f"""
+
+商品与业务事实：
+{item_desc}
+
+议价设置：
+- 当前议价次数：{bargain_count}
+- 最大议价轮数：{max_bargain_rounds}
+- 最大优惠百分比：{max_discount_percent}%
+- 最大优惠金额：{max_discount_amount}元
+
+安全边界：
+- 只能依据上述商品事实回答，不得编造库存、规格、物流或售后承诺。
+- 付款、发货、退款、收货和订单完成由系统订单状态与自动发货规则处理。
+- 未经系统确认，不得声称上述操作已成功，也不得要求买家重复付款。
+- 直接输出适合发送给买家的简短回复，不要解释规则。"""
+
+        messages = [
+            {"role": "system", "content": system_prompt + safety_prompt},
+            *[
+                {"role": msg["role"], "content": msg["content"]}
+                for msg in context
+                if msg.get("role") in {"user", "assistant"}
+                and not self.is_system_or_order_event(msg.get("content"))
+            ],
+            {"role": "user", "content": message},
+        ]
+
+        return {
+            'messages': messages,
+            'system_prompt': system_prompt,
+            'safety_prompt': safety_prompt,
+            'knowledge': knowledge,
+            'override': override_info,
+            'intent': intent,
+            'bargain_count': bargain_count,
+            'max_bargain_rounds': max_bargain_rounds,
+            'max_discount_percent': max_discount_percent,
+            'max_discount_amount': max_discount_amount,
+        }
 
     # 部分服务端（vLLM、OpenRouter 转发的推理模型等）不走 reasoning_content，
     # 而是把思维链内联进 content，用 <think>…</think> 包裹。截断时可能只有开标签。
@@ -675,49 +775,27 @@ class AIReplyEngine:
                         self.save_conversation(chat_id, cookie_id, user_id, item_id, "assistant", refuse_reply, intent)
                         return refuse_reply
 
-                # 6. 构建提示词
-                system_prompt = self._resolve_system_prompt(
-                    settings.get('custom_prompts', ''),
-                    intent,
+                # 6. 找出该「买家-商品」是否有专属规则（没有则用账号级配置）
+                override = db_manager.find_ai_reply_override(cookie_id, user_id, item_id)
+                if override:
+                    logger.info(
+                        f"【{cookie_id}】命中AI专属规则: id={override.get('id')}, "
+                        f"name={override.get('name') or '-'}, "
+                        f"buyer={override.get('buyer_id') or '不限'}, "
+                        f"item={override.get('item_id') or '不限'}"
+                    )
+
+                # 7-8. 拼装提示词。与前端「提示词预览」共用同一段逻辑，避免两边不一致。
+                prompt_parts = self._compose_prompt_parts(
+                    settings=settings,
+                    intent=intent,
+                    item_info=item_info,
+                    message=message,
+                    context=context,
+                    bargain_count=bargain_count,
+                    override=override,
                 )
-
-                # 7. 构建商品信息
-                item_desc = f"商品标题: {item_info.get('title', '未知')}\n"
-                item_desc += f"商品价格: {item_info.get('price', '未知')}元\n"
-                item_desc += f"商品描述: {item_info.get('desc', '无')}"
-
-                # 8. 构建角色化对话消息
-                max_bargain_rounds = settings.get('max_bargain_rounds', 3)
-                max_discount_percent = settings.get('max_discount_percent', 10)
-                max_discount_amount = settings.get('max_discount_amount', 100)
-
-                safety_prompt = f"""
-
-商品与业务事实：
-{item_desc}
-
-议价设置：
-- 当前议价次数：{bargain_count}
-- 最大议价轮数：{max_bargain_rounds}
-- 最大优惠百分比：{max_discount_percent}%
-- 最大优惠金额：{max_discount_amount}元
-
-安全边界：
-- 只能依据上述商品事实回答，不得编造库存、规格、物流或售后承诺。
-- 付款、发货、退款、收货和订单完成由系统订单状态与自动发货规则处理。
-- 未经系统确认，不得声称上述操作已成功，也不得要求买家重复付款。
-- 直接输出适合发送给买家的简短回复，不要解释规则。"""
-
-                messages = [
-                    {"role": "system", "content": system_prompt + safety_prompt},
-                    *[
-                        {"role": msg["role"], "content": msg["content"]}
-                        for msg in context
-                        if msg.get("role") in {"user", "assistant"}
-                        and not self.is_system_or_order_event(msg.get("content"))
-                    ],
-                    {"role": "user", "content": message},
-                ]
+                messages = prompt_parts['messages']
 
                 reply = self._generate_with_retry(settings, messages, cookie_id)
 
@@ -769,7 +847,82 @@ class AIReplyEngine:
         except Exception as e:
             logger.error(f"异步生成回复失败: {e}")
             return None
-    
+
+    def build_prompt_preview(
+        self,
+        cookie_id: str,
+        message: str = '',
+        intent: Optional[str] = None,
+        item_id: str = '',
+        buyer_id: str = '',
+        chat_id: str = '',
+        item_info: Optional[dict] = None,
+        include_history: bool = True,
+    ) -> dict:
+        """给前端看的「提示词预览」：不调用模型，只把真正会发出去的 messages 拼出来。
+
+        与 generate_reply 共用 _compose_prompt_parts，所以预览和实际发送内容一致；
+        一旦哪天分叉，预览就会变成骗人的东西，这也是没有另写一份拼装逻辑的原因。
+        """
+        settings = db_manager.get_ai_reply_settings(cookie_id)
+        sample_message = (message or '').strip() or '你好，这个还有货吗？'
+        resolved_intent = (intent or '').strip() or self.detect_intent(sample_message, cookie_id)
+
+        # 商品信息没显式给就按线上同一条路径从库里取，保证预览贴近真实
+        if not item_info and item_id:
+            raw_item = db_manager.get_item_info(cookie_id, item_id)
+            if raw_item:
+                item_info = {
+                    'title': raw_item.get('item_title') or '未知商品',
+                    'price': raw_item.get('item_price') or '0',
+                    'desc': raw_item.get('item_detail') or '暂无商品描述',
+                }
+        if not item_info:
+            item_info = {'title': '（未指定商品）', 'price': '0', 'desc': '（无商品描述）'}
+
+        context = []
+        if include_history and chat_id and settings.get('context_enabled', True):
+            context = self.get_conversation_context(
+                chat_id,
+                cookie_id,
+                item_id=item_id or None,
+                limit=max(2, min(30, int(settings.get('context_message_limit', 12)))),
+                max_age_minutes=max(5, min(1440, int(settings.get('context_expire_minutes', 120)))),
+            )
+
+        override = db_manager.find_ai_reply_override(cookie_id, buyer_id, item_id)
+        parts = self._compose_prompt_parts(
+            settings=settings,
+            intent=resolved_intent,
+            item_info=item_info,
+            message=sample_message,
+            context=context,
+            bargain_count=0,
+            override=override,
+        )
+
+        return {
+            'success': True,
+            'cookie_id': cookie_id,
+            'ai_enabled': bool(settings.get('ai_enabled')),
+            'api_key_configured': bool(settings.get('api_key')),
+            'model_name': settings.get('model_name') or '',
+            'base_url': settings.get('base_url') or '',
+            'intent': resolved_intent,
+            'intent_options': ['price', 'tech', 'default'],
+            'sample_message': sample_message,
+            'item_info': item_info,
+            'account_custom_prompts': settings.get('custom_prompts') or '',
+            'default_prompts': dict(self.default_prompts),
+            'override': parts['override'],
+            'system_message': parts['messages'][0]['content'],
+            'messages': parts['messages'],
+            'context_message_count': len(context),
+            'max_bargain_rounds': parts['max_bargain_rounds'],
+            'max_discount_percent': parts['max_discount_percent'],
+            'max_discount_amount': parts['max_discount_amount'],
+        }
+
     def get_conversation_context(self, chat_id: str, cookie_id: str, item_id: Optional[str] = None,
                                  limit: int = 20, max_age_minutes: int = 120,
                                  exclude_current: Optional[Dict] = None) -> List[Dict]:

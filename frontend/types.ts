@@ -605,3 +605,49 @@ export interface ItemSearchResult {
   source?: string;
   error?: string;
 }
+
+// AI 专属覆盖规则（买家/商品级）：buyer_id / item_id 留空表示该维度不限制
+export interface AIReplyOverride {
+  id: number;
+  user_id?: number;
+  cookie_id: string;
+  buyer_id: string;
+  item_id: string;
+  name: string;
+  custom_prompts: string;
+  knowledge: string;
+  enabled: boolean;
+  priority: number;
+  created_at?: string;
+  updated_at?: string;
+}
+
+// 「提示词预览」返回的最终结构（不调用模型）
+export interface AIReplyPromptPreview {
+  success: boolean;
+  ai_enabled: boolean;
+  api_key_configured: boolean;
+  model_name: string;
+  base_url: string;
+  intent: string;
+  intent_options: string[];
+  sample_message: string;
+  item_info: { title?: string; price?: string | number; desc?: string };
+  account_custom_prompts: string;
+  default_prompts: Record<string, string>;
+  override: null | {
+    id: number;
+    name: string;
+    buyer_id: string;
+    item_id: string;
+    priority: number;
+    used_custom_prompts: boolean;
+    knowledge_chars: number;
+  };
+  system_message: string;
+  messages: Array<{ role: string; content: string }>;
+  context_message_count: number;
+  max_bargain_rounds: number;
+  max_discount_percent: number;
+  max_discount_amount: number;
+}

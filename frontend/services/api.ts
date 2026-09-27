@@ -10,7 +10,8 @@ import {
   , ChatAccount, ChatConversation, ChatMessage, ProductMaterial,
   ProductFilterRule, ProductDeleteRule, AutomationTaskRun,
   ProductAutomationResult, ProductDeletePreview, QuickPhrase,
-  AnnouncementPayload, ItemSearchResult
+  AnnouncementPayload, ItemSearchResult,
+  AIReplyOverride, AIReplyPromptPreview
 } from '../types';
 
 // Auth
@@ -105,6 +106,44 @@ export const addAccountByCookie = async (cookie: string): Promise<{
   message?: string;
 }> => {
   return post('/cookie-login', { cookie });
+};
+
+// ==================== AI 专属提示词（买家/商品级）与提示词预览 ====================
+
+// 列出某账号的专属规则
+export const getAIReplyOverrides = async (cookieId: string): Promise<AIReplyOverride[]> => {
+  return get(`/ai-reply-overrides/${encodeURIComponent(cookieId)}`);
+};
+
+export const createAIReplyOverride = async (
+  cookieId: string,
+  data: Partial<AIReplyOverride>,
+): Promise<{ success: boolean; id: number }> => {
+  return post(`/ai-reply-overrides/${encodeURIComponent(cookieId)}`, data);
+};
+
+export const updateAIReplyOverride = async (
+  cookieId: string,
+  overrideId: number,
+  data: Partial<AIReplyOverride>,
+): Promise<{ success: boolean; id: number }> => {
+  return put(`/ai-reply-overrides/${encodeURIComponent(cookieId)}/${overrideId}`, data);
+};
+
+export const deleteAIReplyOverride = async (
+  cookieId: string,
+  overrideId: number,
+): Promise<{ success: boolean }> => {
+  return del(`/ai-reply-overrides/${encodeURIComponent(cookieId)}/${overrideId}`);
+};
+
+// 提示词预览：不调用模型、不消耗额度，只看最终拼出来的 messages
+// （拼装逻辑与真实回复共用，所以看到的就是实际会发出去的内容）
+export const previewAIReplyPrompt = async (
+  cookieId: string,
+  data: { message?: string; intent?: string; item_id?: string; buyer_id?: string; chat_id?: string },
+): Promise<AIReplyPromptPreview> => {
+  return post(`/ai-reply-preview/${encodeURIComponent(cookieId)}`, data, { timeout: 60000 });
 };
 
 // 商品搜索：后端会真的拉起浏览器去闲鱼搜，首次可能要几十秒，超时给足。
