@@ -455,7 +455,7 @@ class XianyuSliderStealth:
 
             # 同一账号的持久化 profile 是独占的：抢不到时宁可在这里明确报错，
             # 也不要拿到一个“页面能开、一操作就卡死”的半个浏览器。
-            if not self._profile_held:
+            if not getattr(self, '_profile_held', False):
                 from utils.browser_profile import acquire_profile
 
                 acquire_profile(self.pure_user_id, "滑块验证")
@@ -643,7 +643,7 @@ class XianyuSliderStealth:
             self._browser_slot_held = False
             browser_limit.release_slot("滑块验证")
 
-        if self._profile_held:
+        if getattr(self, '_profile_held', False):
             self._profile_held = False
             from utils.browser_profile import release_profile
 
@@ -2400,7 +2400,7 @@ class XianyuSliderStealth:
             self._browser_slot_held = False
             browser_limit.release_slot("滑块验证")
 
-        if self._profile_held:
+        if getattr(self, '_profile_held', False):
             self._profile_held = False
             from utils.browser_profile import release_profile
 
@@ -4300,7 +4300,10 @@ class XianyuSliderStealth:
             for proc in psutil.process_iter(['pid', 'cmdline']):
                 try:
                     cmdline = ' '.join(proc.info.get('cmdline') or [])
-                    if marker in cmdline:
+                    # 路径分隔符要归一：marker 用正斜杠，而 Windows 上传给 Chrome 的
+                    # --user-data-dir 是反斜杠，直接比会永远匹配不上（进程杀不掉，
+                    # 看门狗只能看着卡死）。
+                    if marker in cmdline.replace('\\', '/'):
                         proc.kill()
                         killed += 1
                 except (psutil.NoSuchProcess, psutil.AccessDenied, Exception):

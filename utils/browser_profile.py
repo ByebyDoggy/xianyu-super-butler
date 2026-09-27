@@ -181,12 +181,16 @@ def clean_singleton_lock_files(profile_path: str, label: str = '') -> None:
 
 
 def profile_process_marker(cookie_id: str) -> str:
-    """用于精确匹配"这个账号的浏览器进程"的命令行特征。
+    """用于精确匹配“这个账号的浏览器进程”的命令行特征。
 
     统一目录后仍然按 user_data_dir 匹配，避免误杀用户自己开的浏览器
     或其他账号的实例。
+
+    分隔符固定用 `/`：Windows 上传给 Chrome 的 `--user-data-dir` 是反斜杠，
+    所以调用方比对前会先把命令行里的反斜杠归一成 `/`（见 _kill_browser_process）。
+    这样同一份 marker 在 Windows / Linux / Docker 里都能用。
     """
-    return os.path.join('browser_data', f'account_{safe_profile_name(cookie_id)}')
+    return f'browser_data/account_{safe_profile_name(cookie_id)}'
 
 
 def launch_args(window_size: str = '1920,1080') -> list:

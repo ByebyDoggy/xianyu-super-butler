@@ -118,8 +118,10 @@ class KillBrowserProcessTests(unittest.TestCase):
                 killed.append(self.info['cmdline'])
 
         procs = [
-            FakeProc(['chrome', f'--user-data-dir=/app/browser_data/slider_{instance.pure_user_id}']),
-            FakeProc(['chrome', f'--user-data-dir=/app/browser_data/slider_{other.pure_user_id}']),
+            # profile 目录已统一为 browser_data/account_<账号ID>（登录/滑块/人工验证
+            # 共用同一份上下文），这里跟着改成新目录名。
+            FakeProc(['chrome', f'--user-data-dir=/app/browser_data/account_{instance.pure_user_id}']),
+            FakeProc(['chrome', f'--user-data-dir=/app/browser_data/account_{other.pure_user_id}']),
             FakeProc(['chrome', '--user-data-dir=/Users/me/Library/Application Support/Google/Chrome']),
         ]
 

@@ -22,6 +22,7 @@ class SliderSlotReleaseTests(unittest.TestCase):
         instance.user_id = "acc"
         instance.pure_user_id = "acc"
         instance._browser_slot_held = True
+        instance._profile_held = True  # 每个账号的持久化 profile 也要归还
         instance.page = None
         instance.context = None
         instance.browser = None
@@ -31,10 +32,30 @@ class SliderSlotReleaseTests(unittest.TestCase):
     def test_init_failure_cleanup_returns_the_slot(self):
         instance = self._make_instance()
 
-        with patch.object(browser_limit, "release_slot") as release:
+        with patch.object(browser_limit, "release_slot") as release, patch(
+            "utils.browser_profile.release_profile"
+        ) as release_profile:
             instance._cleanup_on_init_failure()
 
         # 浏览器启动失败时只清进程不还槽位，槽位就永久漏掉
+        release.assert_called_once()
+        self.assertFalse(instance._browser_slot_held)
+        # 同时要把 profile 占用还掉，否则同账号的下一个任务会一直等锁
+        release_profile.assert_called_once()
+        self.assertFalse(instance._profile_held)
+
+    def test_cleanup_works_without_profile_attribute(self):
+        """初始化很早就失败时可能还没轮到设置 _profile_held。
+
+        清理函数本身就是跑在异常路径上的：在这里再抛 AttributeError 会把真正的
+        初始化错误盖掉，而且槽位已经漏了。所以必须容忍属性缺失。
+        """
+        instance = self._make_instance()
+        del instance._profile_held
+
+        with patch.object(browser_limit, "release_slot") as release:
+            instance._cleanup_on_init_failure()
+
         release.assert_called_once()
         self.assertFalse(instance._browser_slot_held)
 
@@ -51,11 +72,15 @@ class SliderSlotReleaseTests(unittest.TestCase):
     def test_cleanup_without_slot_releases_nothing(self):
         instance = self._make_instance()
         instance._browser_slot_held = False
+        instance._profile_held = False
 
-        with patch.object(browser_limit, "release_slot") as release:
+        with patch.object(browser_limit, "release_slot") as release, patch(
+            "utils.browser_profile.release_profile"
+        ) as release_profile:
             instance._cleanup_on_init_failure()
 
         release.assert_not_called()
+        release_profile.assert_not_called()
 
 
 class PasswordLoginSlotReleaseTests(unittest.TestCase):
