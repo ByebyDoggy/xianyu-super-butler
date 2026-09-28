@@ -3312,9 +3312,14 @@ class XianyuLive:
             # 检查是否配置了用户名和密码
             if not username or not password:
                 logger.warning(f"【{self.cookie_id}】未配置用户名或密码，跳过密码登录刷新")
+                # 用 'need_relogin' 这个类型：与 _mark_session_expired 共用同一个
+                # 冷却窗口，避免同一件事两条通知（谁先发谁生效）。
                 await self.send_token_refresh_notification(
-                    f"检测到{trigger_reason}，但未配置用户名或密码，无法自动刷新Cookie",
-                    "no_credentials"
+                    f"账号登录态已失效（触发场景：{trigger_reason}），"
+                    f"且未配置用户名/密码，无法自动续期。\n"
+                    f"现象：消息还能收发、卡券也照发，但「确认发货」会失败，"
+                    f"订单会卡在待发货。\n请重新扫码登录该账号。",
+                    "need_relogin",
                 )
                 return False
             
@@ -5935,18 +5940,21 @@ class XianyuLive:
 
     def _is_normal_token_expiry(self, error_message: str) -> bool:
         """检查是否是正常的令牌过期或其他不需要通知的情况"""
-        # 不需要发送通知的关键词
+        # 不需要发送通知的关键词。
+        # 只收录「会自愈」的情况：签名令牌过期下一次请求就会带新令牌重试成功，
+        # Token 定时刷新失败会自动重试 —— 这些刷用户没意义。
+        #
+        # ⚠️ 这里曾经也把 'Session过期' / 'FAIL_SYS_SESSION_EXPIRED' 当“正常”
+        # 吞掉，方向刚好反了：会话过期是**终态**，滑块、等待、重试都救不回来，
+        # 只能重新扫码，而且此时消息还能收发（IM 长连接用旧 token），界面还是
+        # 绿灯——不通知用户就完全没办法知道。
         no_notification_keywords = [
-            # 正常的令牌过期
+            # 正常的令牌过期（可自愈）
             'FAIL_SYS_TOKEN_EXOIRED::令牌过期',
             'FAIL_SYS_TOKEN_EXPIRED::令牌过期',
             'FAIL_SYS_TOKEN_EXOIRED',
             'FAIL_SYS_TOKEN_EXPIRED',
             '令牌过期',
-            # Session过期（正常情况）
-            'FAIL_SYS_SESSION_EXPIRED::Session过期',
-            'FAIL_SYS_SESSION_EXPIRED',
-            'Session过期',
             # Token定时刷新失败（会自动重试）
             'Token定时刷新失败，将自动重试',
             'Token定时刷新失败'

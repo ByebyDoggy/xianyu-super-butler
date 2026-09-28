@@ -94,6 +94,38 @@ class CooldownHardCapTests(unittest.TestCase):
         self.assertTrue(self._blocks(last_check_ago=1200 + 899, last_msg_ago=10))
 
 
+class NormalTokenExpiryFilterTests(unittest.TestCase):
+    """会话过期必须发通知；可自愈的令牌过期才该静默。
+
+    回归：_is_normal_token_expiry 曾经把 'Session过期' / 'FAIL_SYS_SESSION_EXPIRED'
+    也当成「正常」吞掉 —— 方向刚好反了。会话过期是终态（只能重新扫码），
+    而且此时 IM 长连接往往还活着、界面还是绿灯，不通知用户就完全无办法知道。
+    实测因为这条，账号死了几小时、漏了 3 单自动发货，一条通知都没出去。
+    """
+
+    def setUp(self):
+        self.live = XianyuLive.__new__(XianyuLive)
+
+    def test_session_expired_is_not_treated_as_normal(self):
+        for message in (
+            'FAIL_SYS_SESSION_EXPIRED::Session过期',
+            '检测到Session过期，但未配置用户名或密码，无法自动刷新Cookie',
+            '登录态已过期且无法自动续期',
+            '确认发货接口返回会话过期（订单 1）',
+        ):
+            with self.subTest(message=message):
+                self.assertFalse(self.live._is_normal_token_expiry(message))
+
+    def test_self_healing_token_expiry_stays_silent(self):
+        for message in (
+            'FAIL_SYS_TOKEN_EXOIRED::令牌过期',
+            'FAIL_SYS_TOKEN_EXPIRED::令牌过期',
+            'Token定时刷新失败，将自动重试',
+        ):
+            with self.subTest(message=message):
+                self.assertTrue(self.live._is_normal_token_expiry(message))
+
+
 class _FakeResp:
     def __init__(self, payload):
         self._payload = payload
