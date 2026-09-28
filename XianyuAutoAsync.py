@@ -4941,8 +4941,11 @@ class XianyuLive:
         except Exception as e:
             logger.error(f"【{self.cookie_id}】更新默认回复图片URL失败: {e}")
 
-    async def get_ai_reply(self, send_user_name: str, send_user_id: str, send_message: str, item_id: str, chat_id: str):
-        """获取AI回复"""
+    async def get_ai_reply(self, send_user_name: str, send_user_id: str, send_message: str, item_id: str, chat_id: str, images: list = None):
+        """获取AI回复
+
+        images: 买家随本条消息发来的图片 URL 列表（可选），有图时走多模态。
+        """
         try:
             from app.ai_reply_engine import ai_reply_engine
 
@@ -4980,7 +4983,8 @@ class XianyuLive:
                 cookie_id=self.cookie_id,
                 user_id=send_user_id,
                 item_id=item_id,
-                skip_wait=True  # 跳过内部等待，因为外部已实现防抖
+                skip_wait=True,  # 跳过内部等待，因为外部已实现防抖
+                images=images,   # 买家发图时随消息一起提交给模型
             )
 
             if reply:
@@ -9725,6 +9729,59 @@ class XianyuLive:
                 if self.active_message_tasks % 100 == 0 and self.active_message_tasks > 0:
                     logger.info(f"【{self.cookie_id}】当前活跃消息处理任务数: {self.active_message_tasks}")
 
+    def _extract_image_urls(self, message) -> list:
+        """从聊天推送帧里取买家发来的图片 URL。
+
+        位置：``message['1']['6']['3']['5']``，是一个 JSON 字符串，形如
+        ``{"contentType":2,"image":{"pics":[{"url":"https://img.alicdn.com/..."}]}}``
+        （contentType：1=文本、2=图片、3=语音，只有 2 才有图）。
+
+        买家发图时 ``reminderContent`` 只是固定字符串 "[图片]"，图片本体只在这条
+        路径里 —— 不解析就只能把 "[图片]" 两个字交给模型。
+
+        只认结构化字段，取不到就返回空列表：绝不能拿会话 ID / 商品 ID / 订单号
+        之类的数字去当图片地址（本项目在这类「猜 ID」上踩过多次坑）。绝大多数
+        消息没有图，走这条分支的开销可以忽略。
+        """
+        try:
+            if not isinstance(message, dict):
+                return []
+            node = message.get("1")
+            for key in ("6", "3"):
+                if not isinstance(node, dict):
+                    return []
+                node = node.get(key)
+            if not isinstance(node, dict):
+                return []
+            raw = node.get("5")
+            if not isinstance(raw, str) or not raw.strip():
+                return []
+
+            try:
+                decoded = json.loads(raw)
+            except json.JSONDecodeError:
+                # 少数形态外层是 base64 包裹的 JSON
+                decoded = json.loads(base64.b64decode(raw).decode("utf-8"))
+            if not isinstance(decoded, dict) or decoded.get("contentType") != 2:
+                return []
+
+            image = decoded.get("image")
+            pics = image.get("pics") if isinstance(image, dict) else None
+            urls = []
+            for pic in (pics or []):
+                if not isinstance(pic, dict):
+                    continue
+                url = str(pic.get("url") or "").strip()
+                if url and url not in urls:
+                    urls.append(url)
+            legacy = str(decoded.get("picUrl") or "").strip()
+            if legacy and legacy not in urls:
+                urls.append(legacy)
+            return urls
+        except Exception as e:
+            logger.warning(f"【{self.cookie_id}】解析图片消息失败: {self._safe_str(e)}")
+            return []
+
     def _extract_message_id(self, message_data: dict) -> str:
         """
         从消息数据中提取消息ID，用于去重
@@ -10075,7 +10132,15 @@ class XianyuLive:
                     matched_keyword = self._find_reply_keyword(send_message, item_id)
                 else:
                     # 2. 关键词匹配失败，如果AI开关打开，尝试AI回复
-                    reply = await self.get_ai_reply(send_user_name, send_user_id, send_message, item_id, chat_id)
+                    # 买家发的是图片时，把图片 URL 一起交给模型；
+                    # 否则模型只看得到 "[图片]" 两个字，等于没看到图。
+                    image_urls = self._extract_image_urls(message_data)
+                    if image_urls:
+                        logger.info(
+                            f"[{msg_time}] 【{self.cookie_id}】买家发来 {len(image_urls)} 张图片，"
+                            f"随消息一起提交给模型"
+                        )
+                    reply = await self.get_ai_reply(send_user_name, send_user_id, send_message, item_id, chat_id, images=image_urls)
                     if reply:
                         reply_source = 'AI'  # 标记为AI回复
                         reply_strategy = "ai"

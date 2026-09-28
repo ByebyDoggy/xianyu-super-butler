@@ -119,7 +119,7 @@ class AIReplyEngine:
 
         role_labels = {'system': '系统规则', 'user': '买家', 'assistant': '卖家'}
         prompt = "\n".join(
-            f"{role_labels.get(msg['role'], msg['role'])}：{msg['content']}"
+            f"{role_labels.get(msg['role'], msg['role'])}：{self._content_to_text(msg['content'])}"
             for msg in messages
         )
         prompt += "\n卖家："
@@ -163,12 +163,13 @@ class AIReplyEngine:
         system_instruction = ""
         contents = []
         for msg in messages:
+            content_text = self._content_to_text(msg['content'])
             if msg['role'] == 'system':
-                system_instruction = msg['content']
+                system_instruction = content_text
             elif msg['role'] in {'user', 'assistant'}:
                 contents.append({
                     "role": "user" if msg['role'] == 'user' else "model",
-                    "parts": [{"text": msg['content']}],
+                    "parts": [{"text": content_text}],
                 })
 
         if not contents or contents[-1]["role"] != "user":
@@ -398,6 +399,50 @@ class AIReplyEngine:
 
         return prompt
 
+    @staticmethod
+    def _build_user_content(message: str, images: Optional[list] = None):
+        """把「文本 + 买家图片」拼成 OpenAI 多模态 content。
+
+        没图时原样返回字符串 —— 绝大多数请求走这条路径，行为完全不变。
+        有图时返回 content part 数组（图片既可以是公网 URL，也可以是 data: URL）。
+        买家发图时 reminderContent 只是 "[图片]"，图片本体要从推送帧里解析出来，
+        否则模型只能看到两个字。
+        """
+        urls = [str(u).strip() for u in (images or []) if str(u or '').strip()]
+        if not urls:
+            return message
+        parts = [{
+            "type": "text",
+            "text": f"{message}\n（买家还发来了图片，请结合图片内容回答）",
+        }]
+        parts.extend({"type": "image_url", "image_url": {"url": u}} for u in urls)
+        return parts
+
+    @staticmethod
+    def _content_to_text(content) -> str:
+        """把多模态 content 降级成纯文本。
+
+        给两个地方用：只吃纯文本的服务端分支（DashScope / Gemini），以及前端
+        的「提示词预览」—— 数组直接渲染会变成 [object Object]。
+        """
+        if isinstance(content, str):
+            return content
+        if not isinstance(content, list):
+            return str(content or '')
+        chunks = []
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            if part.get('type') == 'text':
+                chunks.append(str(part.get('text') or ''))
+            elif part.get('type') == 'image_url':
+                url = str((part.get('image_url') or {}).get('url') or '')
+                if url.startswith('data:'):
+                    chunks.append('[图片: (base64)]')
+                elif url:
+                    chunks.append(f'[图片: {url[:120]}]')
+        return '\n'.join(c for c in chunks if c)
+
     def _compose_prompt_parts(
         self,
         settings: dict,
@@ -407,6 +452,7 @@ class AIReplyEngine:
         context: list,
         bargain_count: int,
         override: Optional[dict] = None,
+        images: Optional[list] = None,
     ) -> dict:
         """把「系统提示词 + 安全边界 + 历史上下文 + 当前消息」拼成最终 messages。
 
@@ -472,7 +518,7 @@ class AIReplyEngine:
                 if msg.get("role") in {"user", "assistant"}
                 and not self.is_system_or_order_event(msg.get("content"))
             ],
-            {"role": "user", "content": message},
+            {"role": "user", "content": self._build_user_content(message, images)},
         ]
 
         return {
@@ -710,8 +756,12 @@ class AIReplyEngine:
     
     def generate_reply(self, message: str, item_info: dict, chat_id: str,
                       cookie_id: str, user_id: str, item_id: str,
-                      skip_wait: bool = False) -> Optional[str]:
-        """生成AI回复"""
+                      skip_wait: bool = False, images: Optional[list] = None) -> Optional[str]:
+        """生成AI回复。
+
+        images: 买家随消息发来的图片 URL 列表（可选）。有图时改走多模态，
+        仅影响最后一条 user 消息的 content 形态，其余流程不变。
+        """
         if not self.is_ai_enabled(cookie_id):
             return None
         if self.is_system_or_order_event(message):
@@ -805,6 +855,7 @@ class AIReplyEngine:
                     context=context,
                     bargain_count=bargain_count,
                     override=override,
+                    images=images,
                 )
                 messages = prompt_parts['messages']
 
@@ -847,14 +898,14 @@ class AIReplyEngine:
 
     async def generate_reply_async(self, message: str, item_info: dict, chat_id: str,
                                    cookie_id: str, user_id: str, item_id: str,
-                                   skip_wait: bool = False) -> Optional[str]:
+                                   skip_wait: bool = False, images: Optional[list] = None) -> Optional[str]:
         """
         异步包装器：在独立线程池中执行同步的 `generate_reply`，并返回结果。
         这样可以在异步代码中直接 await，而不阻塞事件循环。
         """
         try:
             import asyncio as _asyncio
-            return await _asyncio.to_thread(self.generate_reply, message, item_info, chat_id, cookie_id, user_id, item_id, skip_wait)
+            return await _asyncio.to_thread(self.generate_reply, message, item_info, chat_id, cookie_id, user_id, item_id, skip_wait, images)
         except Exception as e:
             logger.error(f"异步生成回复失败: {e}")
             return None
@@ -869,6 +920,7 @@ class AIReplyEngine:
         chat_id: str = '',
         item_info: Optional[dict] = None,
         include_history: bool = True,
+        images: Optional[list] = None,
     ) -> dict:
         """给前端看的「提示词预览」：不调用模型，只把真正会发出去的 messages 拼出来。
 
@@ -910,7 +962,18 @@ class AIReplyEngine:
             context=context,
             bargain_count=0,
             override=override,
+            images=images,
         )
+
+        # 预览是给人看的：多模态 content（数组）在前端会渲染成 [object Object]，
+        # 这里统一降级成纯文本，图片显示为 [图片: url]。
+        rendered_messages = [
+            {
+                'role': m.get('role'),
+                'content': self._content_to_text(m.get('content')),
+            }
+            for m in parts['messages']
+        ]
 
         return {
             'success': True,
@@ -927,7 +990,8 @@ class AIReplyEngine:
             'default_prompts': dict(self.default_prompts),
             'override': parts['override'],
             'system_message': parts['messages'][0]['content'],
-            'messages': parts['messages'],
+            'messages': rendered_messages,
+            'has_images': bool(images),
             'context_message_count': len(context),
             'max_bargain_rounds': parts['max_bargain_rounds'],
             'max_discount_percent': parts['max_discount_percent'],
