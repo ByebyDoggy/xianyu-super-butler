@@ -13,7 +13,7 @@
 import json
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from XianyuAutoAsync import XianyuLive
 from app.ai_reply_engine import AIReplyEngine
@@ -47,7 +47,11 @@ def _image_message(content: str = REAL_IMAGE_CONTENT):
             "4": 0,
             "5": 1790561731431,
             "6": {"1": 101, "3": {"1": "", "2": "[图片]", "3": "", "4": 2, "5": content}},
-            "10": {"reminderContent": "[图片]", "senderUserId": "2218289862997"},
+            "10": {
+                "reminderContent": "[图片]",
+                "senderUserId": "2218289862997",
+                "bizTag": json.dumps({"sourceId": "S:1", "messageId": "e3db3f54777e4fe792e96e5d571bc4e9"}),
+            },
         }
     }
 
@@ -420,6 +424,73 @@ class HistoryImageContextTests(unittest.TestCase):
         ]
         for msg in self._history(self._parts(context)):
             self.assertIsInstance(msg["content"], str)
+
+
+class HandleMessageThreadsDecryptedPayloadTests(unittest.IsolatedAsyncioTestCase):
+    """handle_message 必须把「解密后的业务消息」交给防抖链路。
+
+    曾经传的是原始推送帧（顶层 headers/body），于是下游所有按 message['1']
+    取值的地方**静默失效**：
+      - messageId 取不到 → 去重退化成 chat_id+文本，同文本一小时内被误判重复
+      - 买家图片 URL 取不到 → 模型只看到 "[图片]"
+    两者都不报错，只能靠这个测试守住。
+    """
+
+    COOKIE = "2218031692538"
+
+    def _live(self):
+        live = XianyuLive.__new__(XianyuLive)
+        live.cookie_id = self.COOKIE
+        live.myid = self.COOKIE
+        live.order_status_handler = None
+        return live
+
+    @staticmethod
+    def _frame(payload, mid="mid-1"):
+        """把解密后的业务消息包成线上那种原始推送帧。"""
+        import base64
+
+        encoded = base64.b64encode(
+            json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        ).decode("ascii")
+        return {
+            "headers": {"mid": mid},
+            "body": {"syncPushPackage": {"data": [{"data": encoded}]}},
+        }
+
+    class _WS:
+        async def send(self, *_args, **_kwargs):
+            return None
+
+    async def test_debounce_receives_decrypted_message_with_images(self):
+        live = self._live()
+        captured = {}
+
+        async def fake_schedule(self, **kwargs):  # 类方法被替换后仍会收到 self
+            captured.update(kwargs)
+
+        with patch.object(XianyuLive, "send_notification", AsyncMock()), \
+             patch.object(XianyuLive, "_schedule_debounced_reply", fake_schedule):
+            await live.handle_message(self._frame(_image_message()), self._WS())
+
+        self.assertIn("message_data", captured)
+        threaded = captured["message_data"]
+        # 是解密后的业务消息（有 '1'），不是原始帧（有 'body'）
+        self.assertIn("1", threaded)
+        self.assertNotIn("body", threaded)
+        # 图片真的能从这条链路上解出来 —— 这正是之前失效的地方
+        self.assertTrue(live._extract_image_urls(threaded))
+        # messageId 也要能取到（否则去重会退化成 chat_id+文本 的兜底键）
+        self.assertEqual(
+            live._extract_message_id(threaded), "e3db3f54777e4fe792e96e5d571bc4e9"
+        )
+
+    async def test_raw_frame_would_lose_images_and_message_id(self):
+        """对照：假如误传原始帧，messageId 与图片都会丢（而且是静默的）。"""
+        live = self._live()
+        raw = self._frame(_image_message())
+        self.assertEqual(live._extract_image_urls(raw), [])
+        self.assertIsNone(live._extract_message_id(raw))
 
 
 if __name__ == "__main__":

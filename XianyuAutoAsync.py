@@ -9874,7 +9874,9 @@ class XianyuLive:
         
         Args:
             chat_id: 聊天ID
-            message_data: 原始消息数据
+            message_data: **解密后的业务消息**（形如 {'1': {...}}），
+                不是原始推送帧。下游的 _extract_message_id / _add_reply_decision_log /
+                _extract_image_urls 都按 message_data['1']... 取值。
             websocket: WebSocket连接
             send_user_name: 发送者用户名
             send_user_id: 发送者用户ID
@@ -9882,6 +9884,17 @@ class XianyuLive:
             item_id: 商品ID
             msg_time: 消息时间
         """
+        # 自检：这里必须是「解密后的业务消息」。如果拿到的是原始帧（顶层是
+        # headers/body），下面所有按 message_data['1'] 取值的地方都会**静默失效**：
+        #   - messageId 取不到，去重退化成 chat_id+文本 的兜底键
+        #   - 买家图片 URL 取不到，模型只看到 "[图片]"
+        # 两者都不报错，所以只能主动吼一声。
+        if isinstance(message_data, dict) and "1" not in message_data and "body" in message_data:
+            logger.error(
+                f"【{self.cookie_id}】防抖链路收到的是原始推送帧而非解密后的消息，"
+                f"messageId 与买家图片都会丢失，请检查 handle_message 的传参"
+            )
+
         # 提取消息ID并检查是否已处理
         message_id = self._extract_message_id(message_data)
         # 如果没有 messageId，使用备用标识（chat_id + send_message + 时间戳）
@@ -10020,7 +10033,7 @@ class XianyuLive:
         处理聊天消息的回复逻辑（从handle_message中提取出来的核心回复逻辑）
         
         Args:
-            message_data: 原始消息数据
+            message_data: **解密后的业务消息**（与 _schedule_debounced_reply 一致）
             websocket: WebSocket连接
             send_user_name: 发送者用户名
             send_user_id: 发送者用户ID
@@ -10868,9 +10881,14 @@ class XianyuLive:
 
             # 使用防抖机制处理聊天消息回复
             # 如果用户连续发送消息，等待用户停止发送后再回复最后一条消息
+            # 注意：这里必须传「解密后的业务消息」message，而不是原始帧 message_data。
+            # 下游（_extract_message_id / _add_reply_decision_log / _extract_image_urls）
+            # 读的都是 message['1']...，传原始帧会让它们全部静默失效：
+            #   - messageId 取不到 → 去重退化成 chat_id+文本，同文本一小时内被误判重复
+            #   - 买家图片 URL 取不到 → 模型只看到 "[图片]"，等于没看到图
             await self._schedule_debounced_reply(
                 chat_id=chat_id,
-                message_data=message_data,
+                message_data=message,
                 websocket=websocket,
                 send_user_name=send_user_name,
                 send_user_id=send_user_id,
