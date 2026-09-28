@@ -1620,6 +1620,18 @@ class XianyuLive:
             chat_id_raw = message_1.get("2", "")
             chat_id = str(chat_id_raw).split("@")[0] if chat_id_raw else ""
 
+            # ⚠️ 会话 ID 不是买家 ID。系统/红点/交易卡片类消息里 message['1'] 经常是
+            # 字符串形态的会话 ID（形如 67283659765@goofish），历史上有调用方把它的
+            # 数字部分当买家 ID 传进来，于是订单行的 buyer_id 变成了 chat_id，随后
+            # 正常的付款触发被「买家归属一致性」校验误杀（实测订单 3316467182168008768
+            # 的 buyer_id 就是它自己的 chat_id）。这里再兜一层，宁可不写也不写错。
+            if buyer_id and chat_id and str(buyer_id) == str(chat_id):
+                logger.warning(
+                    f"【{self.cookie_id}】订单 {order_id} 的 buyer_id({buyer_id}) 与"
+                    f"会话 ID 相同，疑似会话 ID 冒充买家 ID，已忽略该值"
+                )
+                buyer_id = None
+
             created_at = None
             create_time = message_1.get("5")
             if create_time:
@@ -1799,9 +1811,35 @@ class XianyuLive:
                 if current_order.get('item_id') and item_id and str(current_order.get('item_id')) != str(item_id):
                     logger.error(f'[{msg_time}] 【{self.cookie_id}】订单 {order_id} 商品归属不一致，拒绝自动发货')
                     return
-                if current_order.get('buyer_id') and str(current_order.get('buyer_id')) != str(send_user_id):
-                    logger.error(f'[{msg_time}] 【{self.cookie_id}】订单 {order_id} 买家归属不一致，拒绝自动发货')
-                    return
+                # 买家归属校验：**只做提示 + 修正，不再拦截**。
+                # 订单行里的 buyer_id 与聊天推送里的 senderUserId 来源不同，历史上还
+                # 被写错过（系统卡片的 message['1'] 是会话 ID，被当成买家 ID 存进了订单，
+                # 见 handle_message 里的修正），于是正常付款触发被判「买家归属不一致」
+                # 直接拒发 —— 实测同一订单 15 秒后换个触发词就能发成功。
+                # 订单是不是本账号的，由上面的 cookie_id 校验保证；能不能发，由下面的
+                # 平台 pending_ship 状态保证。所以这里不一致时按消息里的真实发送者修正
+                # 订单记录并继续，而不是把订单丢掉。
+                stored_buyer_id = str(current_order.get('buyer_id') or '')
+                if stored_buyer_id and str(send_user_id) and stored_buyer_id != str(send_user_id):
+                    stored_chat_id = str(current_order.get('chat_id') or '')
+                    looks_like_chat_id = bool(stored_chat_id) and stored_buyer_id == stored_chat_id
+                    logger.warning(
+                        f'[{msg_time}] 【{self.cookie_id}】订单 {order_id} 记录的买家 '
+                        f'{stored_buyer_id} 与消息发送者 {send_user_id} 不一致'
+                        f'{"（记录里存的是会话 ID）" if looks_like_chat_id else ""}，'
+                        f'按消息发送者修正后继续发货'
+                    )
+                    try:
+                        db_manager.insert_or_update_order(
+                            order_id=order_id,
+                            buyer_id=str(send_user_id),
+                        )
+                        current_order['buyer_id'] = str(send_user_id)
+                    except Exception as repair_e:
+                        logger.warning(
+                            f'[{msg_time}] 【{self.cookie_id}】修正订单 {order_id} 买家归属失败: '
+                            f'{self._safe_str(repair_e)}'
+                        )
 
                 # 消息里没提到商品时，沿用订单已记录的 item_id。
                 # 原来会把空 item_id 拿去和订单比（str(None) != '1084...' 永远成立），
@@ -10289,21 +10327,27 @@ class XianyuLive:
                         temp_user_id = None
                         temp_item_id = None
 
-                        # 提取用户ID
+                        # 提取买家ID。⚠️ 只能取结构化字段：message['1'] 在系统/红点/
+                        # 交易卡片消息里是字符串形态的「会话 ID」（形如 67283659765@goofish），
+                        # 原来把它的数字部分当买家 ID 写进了订单快照，于是一条正常的付款
+                        # 触发消息到达时，「买家归属一致性」校验必然不一致 → 自动发货被拒
+                        # （实测订单 3316467182168008768 的 buyer_id 就被写成了它自己的 chat_id）。
+                        # 取不到就留空，宁可不写也不能拿会话 ID 冒充买家 ID。
                         try:
                             message_1 = message.get("1")
-                            if isinstance(message_1, str) and '@' in message_1:
-                                temp_user_id = message_1.split('@')[0]
+                            if isinstance(message_1, str):
+                                # 字符串形态只可能是会话/对端标识，不是买家 user id
+                                temp_user_id = None
                             elif isinstance(message_1, dict):
-                                # 从字典中提取用户ID
-                                if "10" in message_1 and isinstance(message_1["10"], dict):
-                                    temp_user_id = message_1["10"].get("senderUserId", "unknown_user")
+                                message_1_10 = message_1.get("10")
+                                if isinstance(message_1_10, dict):
+                                    temp_user_id = message_1_10.get("senderUserId") or None
                                 else:
-                                    temp_user_id = "unknown_user"
+                                    temp_user_id = None
                             else:
-                                temp_user_id = "unknown_user"
-                        except:
-                            temp_user_id = "unknown_user"
+                                temp_user_id = None
+                        except Exception:
+                            temp_user_id = None
 
                         # 提取商品ID
                         try:
