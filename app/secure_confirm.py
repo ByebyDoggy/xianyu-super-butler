@@ -163,6 +163,24 @@ class SecureConfirm:
                     error_msg = res_json.get('ret', ['未知错误'])[0] if res_json.get('ret') else '未知错误'
                     logger.warning(f"【{self.cookie_id}】❌ 自动确认发货失败: {error_msg}")
 
+                    # 会话/令牌过期重试多少次结果都一样（实测递归 4 次全是同一个
+                    # SESSION_EXPIRED）。直接停手，并把账号标成「需重新登录」，
+                    # 否则界面还是绿灯「监听中」，漏发只能等人发现。
+                    if 'Session过期' in error_msg or 'SESSION_EXPIRED' in error_msg.upper():
+                        if self.main_instance is not None:
+                            try:
+                                await self.main_instance._mark_session_expired(
+                                    f"确认发货接口返回会话过期（订单 {order_id}）"
+                                )
+                            except Exception as mark_e:
+                                logger.warning(f"标记会话过期失败: {self._safe_str(mark_e)}")
+                        return {
+                            "success": False,
+                            "order_id": order_id,
+                            "error": error_msg,
+                            "need_relogin": True,
+                        }
+
                     return await self.auto_confirm(order_id, item_id, retry_count + 1)
 
 

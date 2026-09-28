@@ -885,6 +885,14 @@ class XianyuLive:
         self.last_message_received_time = 0  # 记录上次收到消息的时间
         self.message_cookie_refresh_cooldown = 300  # 收到消息后5分钟内不执行Cookie刷新
 
+        # 会话健康检查的「最长推迟时间」。
+        # 上面这个冷却本意是「别在买家正聊着的时候刷 Cookie / 重连」，但它会被
+        # 无限期推迟：店里只要有消息就永远处在冷却里，于是「登录态已过期」这种
+        # 终态故障一直查不出来 —— 反而越活跃的账号越查不出来（实测因此漏了 3 单
+        # 自动发货，界面还一直显示绿灯「监听中」）。
+        # 超过这个上限就不再理会冷却，先保证故障能被发现。
+        self.session_check_max_delay = 900
+
         # 入站推送看门狗。WebSocket 可能是「僵尸」状态：心跳和请求响应都正常，
         # 但平台不再推送买家消息（实测被浏览器刷 Cookie 打开的 /im 页面顶掉）。
         # 这里记录最后一次收到「平台主动推送」的时间，静默过久就主动重连重新 /reg。
@@ -2205,11 +2213,24 @@ class XianyuLive:
                                     chat_id
                                 )
                             elif confirm_required and not platform_confirmed:
+                                # 卡券已经发到买家手上了，但平台没标成已发货。
+                                # 这是真金白银的漏发（买家拿到卡、订单卡在待发货
+                                # 还可能被平台判超时），告警必须带上订单号和处置建议。
+                                hint = ""
+                                if confirm_error and (
+                                    'Session过期' in str(confirm_error)
+                                    or 'SESSION_EXPIRED' in str(confirm_error).upper()
+                                ):
+                                    hint = (
+                                        "\n⚠️ 原因是登录态已过期，重试无效："
+                                        "请重新扫码登录该账号，再手动确认发货。"
+                                    )
                                 await self.send_delivery_failure_notification(
                                     send_user_name,
                                     send_user_id,
                                     item_id,
-                                    f"卡券已全部发送，但闲鱼确认发货失败，请手动确认：{confirm_error}",
+                                    f"订单 {order_id}：卡券已发送给买家，但闲鱼「确认发货」失败，"
+                                    f"订单仍停在待发货，请手动确认：{confirm_error}{hint}",
                                     chat_id
                                 )
                             elif len(delivery_contents) > 1:
@@ -2250,6 +2271,55 @@ class XianyuLive:
             logger.error(f"统一自动发货处理异常: {self._safe_str(e)}")
 
 
+
+    def _cooldown_blocks_session_check(self, now: float, last_check_time: float, interval: float) -> bool:
+        """「收到消息后冷却」是否应该继续挡住这次会话检查。
+
+        冷却的本意是别在买家正聊着的时候刷 Cookie / 重连（会打断会话），
+        但它不该把检查无限期推迟：只要店里一直有人说话，冷却就一直生效，
+        于是登录态过期这种终态故障永远查不出来。
+
+        所以给一个上限：推迟时间超过 interval + session_check_max_delay 就
+        不再等冷却，先把故障查出来。
+        """
+        if self.last_message_received_time <= 0:
+            return False
+        if now - self.last_message_received_time >= self.message_cookie_refresh_cooldown:
+            return False
+        return (now - last_check_time) < (interval + self.session_check_max_delay)
+
+    async def _mark_session_expired(self, reason: str) -> bool:
+        """把账号标为「登录态已过期，需要重新登录」，并通知一次。
+
+        为什么需要统一入口：闲鱼会话过期后，IM 长连接往往还活着（用的还是
+        旧 token），于是界面显示「监听中」、消息照收、卡密照发，只有 mtop
+        接口（确认发货 / 拉订单 / 图片上传 / 取 IM token）在静默失败。
+        实测这种「半死」状态漏了 3 单自动发货，而光看界面完全看不出来。
+
+        标记的清除交给 refresh_token 成功时（会话真的恢复才清）。
+
+        Returns:
+            是否本次首次标记（用于避免重复通知）。
+        """
+        first_time = not self.needs_relogin
+        self.needs_relogin = True
+        self.relogin_reason = reason
+        if first_time:
+            logger.error(
+                f"【{self.cookie_id}】{reason} —— 已置为「需重新扫码」。"
+                f"注意：此时消息通常还能收发（IM 长连接用的是旧 token），"
+                f"但确认发货 / 拉订单 / 图片上传都会失败"
+            )
+            try:
+                await self.send_token_refresh_notification(
+                    f"{reason}\n\n"
+                    f"现象：消息还能收发、卡券也照发，但「确认发货」失败，"
+                    f"订单会卡在待发货。\n请重新扫码登录该账号。",
+                    "need_relogin",
+                )
+            except Exception as e:
+                logger.warning(f"【{self.cookie_id}】发送重新登录通知失败: {self._safe_str(e)}")
+        return first_time
 
     async def refresh_token(self, captcha_retry_count: int = 0):
         """刷新token
@@ -2301,8 +2371,10 @@ class XianyuLive:
 
             # 【消息接收检查】检查是否在消息接收后的冷却时间内，与 cookie_refresh_loop 保持一致
             current_time = time.time()
-            time_since_last_message = current_time - self.last_message_received_time
-            if self.last_message_received_time > 0 and time_since_last_message < self.message_cookie_refresh_cooldown:
+            if self._cooldown_blocks_session_check(
+                current_time, self.last_token_refresh_time, self.token_refresh_interval
+            ):
+                time_since_last_message = current_time - self.last_message_received_time
                 remaining_time = self.message_cookie_refresh_cooldown - time_since_last_message
                 remaining_minutes = int(remaining_time // 60)
                 remaining_seconds = int(remaining_time % 60)
@@ -7855,6 +7927,7 @@ class XianyuLive:
         )
 
         alerts = []
+        failed_queries = []
         api = XianyuSellerAPI(self.cookie_id, self.cookies_str)
         try:
             for query_code, label in (
@@ -7866,7 +7939,15 @@ class XianyuLive:
                         query_code=query_code, rows_per_page=50
                     )
                 except SellerApiError as exc:
-                    logger.debug(f"【{self.cookie_id}】查询 {query_code} 失败: {exc}")
+                    # 这里以前是 debug 级：接口整体不可用时（例如登录态过期）
+                    # 日志里一个字都看不到，于是「发货超时告警」这道兜底静默失效，
+                    # 卡在待发货的订单没人管。改成 warning 并单独告警。
+                    failed_queries.append(f"{query_code}: {exc}")
+                    logger.warning(f"【{self.cookie_id}】查询 {query_code} 失败: {exc}")
+                    if 'Session过期' in str(exc) or 'SESSION_EXPIRED' in str(exc).upper():
+                        await self._mark_session_expired(
+                            "卖家端接口返回会话过期，发货超时检查无法执行"
+                        )
                     continue
 
                 for item in batch.get("items") or []:
@@ -7885,6 +7966,20 @@ class XianyuLive:
                 self.cookies_str = api.cookies_str
         finally:
             await api.close()
+
+        if failed_queries:
+            # 接口挂了要主动说：否则「查不到超时订单」和「真的没有超时订单」
+            # 在界面上完全一样。
+            try:
+                await self.send_system_notification(
+                    f"⚠️ 订单接口不可用（账号 {self.cookie_id}）\n\n"
+                    + "\n".join(failed_queries[:4])
+                    + "\n\n「发货超时提醒」依赖该接口，现在查不到即将超时/已超时的订单，"
+                      "请检查账号登录态（很可能需要重新扫码）。"
+                )
+                logger.warning(f"【{self.cookie_id}】订单接口不可用，已发送告警（{len(failed_queries)} 个查询失败）")
+            except Exception as e:
+                logger.warning(f"【{self.cookie_id}】发送订单接口不可用告警失败: {self._safe_str(e)}")
 
         if not alerts:
             return 0
@@ -8175,7 +8270,12 @@ class XianyuLive:
                     if current_time - self.last_cookie_refresh_time >= self.cookie_refresh_interval:
                         # 检查是否在消息接收后的冷却时间内
                         time_since_last_message = current_time - self.last_message_received_time
-                        if time_since_last_message < self.message_cookie_refresh_cooldown:
+                        # 冷却只用来错峰，不能无限期推迟（见 _cooldown_blocks_session_check）：
+                        # 否则店里一直有消息时，会话过期永远查不出来。
+                        if self._cooldown_blocks_session_check(
+                            current_time, self.last_cookie_refresh_time, self.cookie_refresh_interval
+                        ):
+                            time_since_last_message = current_time - self.last_message_received_time
                             remaining_time = self.message_cookie_refresh_cooldown - time_since_last_message
                             remaining_minutes = int(remaining_time // 60)
                             remaining_seconds = int(remaining_time % 60)
@@ -8342,10 +8442,11 @@ class XianyuLive:
                                 logger.info(f"【{self.cookie_id}】✅ 密码登录刷新成功，Cookie已更新")
                             else:
                                 logger.warning(f"【{self.cookie_id}】⚠️ 密码登录刷新失败，Cookie可能仍然无效")
-                                # 发送通知
-                                await self.send_token_refresh_notification(
-                                    f"Cookie验证失败且密码登录刷新也失败\n验证详情: {validation_result['details']}",
-                                    "cookie_validation_failed"
+                                # 走到这里已经确定「关键 API 不可用且无法自动续期」。
+                                # 以前这里只打 warning + 发通知，界面状态没更新，
+                                # 于是账号一直显示绿灯「监听中」。统一标记一下。
+                                await self._mark_session_expired(
+                                    f"Cookie 校验失败且无法自动续期：{validation_result['details']}"
                                 )
                         else:
                             logger.info(f"【{self.cookie_id}】✅ Cookie验证通过: {validation_result['details']}")
