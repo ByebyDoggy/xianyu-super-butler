@@ -241,6 +241,7 @@ class DBManager:
                 item_id TEXT NOT NULL,
                 role TEXT NOT NULL,
                 content TEXT NOT NULL,
+                images TEXT,
                 intent TEXT,
                 bargain_count INTEGER DEFAULT 0,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -1268,6 +1269,15 @@ class DBManager:
                     # system_shipped字段不存在，需要添加
                     self._execute_sql(cursor, "ALTER TABLE orders ADD COLUMN system_shipped INTEGER DEFAULT 0")
                     logger.info("为orders表添加system_shipped字段")
+
+                # 检查ai_conversations表是否有images字段（买家消息携带的图片 URL）
+                # 买家先发图、下一轮再道问时，靠它把图还原回上下文；
+                # 否则历史里只剩 "[图片]"，模型看得到历史也看不懂图。
+                try:
+                    self._execute_sql(cursor, "SELECT images FROM ai_conversations LIMIT 1")
+                except sqlite3.OperationalError:
+                    self._execute_sql(cursor, "ALTER TABLE ai_conversations ADD COLUMN images TEXT")
+                    logger.info("为ai_conversations表添加images字段")
 
                 # 处理keywords表的唯一约束问题
                 # 由于SQLite不支持直接修改约束，我们需要重建表

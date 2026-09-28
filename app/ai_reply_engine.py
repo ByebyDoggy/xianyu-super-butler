@@ -266,6 +266,10 @@ class AIReplyEngine:
     MAX_TOKENS_FLOOR = 200
     MAX_TOKENS_CEILING = 8000
 
+    # 历史消息里最多还原几张图片。图片很吃 token（多模态输入按像素折算），
+    # 买家连发多张时不能把上下文塞满；按「由新到旧」分配，最近的优先。
+    MAX_HISTORY_IMAGES = 2
+
     def _resolve_max_tokens(self, settings: dict) -> int:
         """回复长度上限。
 
@@ -443,6 +447,24 @@ class AIReplyEngine:
                     chunks.append(f'[图片: {url[:120]}]')
         return '\n'.join(c for c in chunks if c)
 
+    @staticmethod
+    def _parse_stored_images(raw) -> list:
+        """把 ai_conversations.images 列（JSON 数组文本）解回 URL 列表。
+
+        历史数据没有这一列（NULL），脏数据也不能让整条上下文挂掉 —— 一律当没图。
+        """
+        if not raw:
+            return []
+        try:
+            data = json.loads(raw)
+        except (TypeError, ValueError):
+            return []
+        if not isinstance(data, list):
+            return []
+        # 只收非空字符串：列表里混进数字/对象就当脏数据丢弃，
+        # 不能 str() 一下当图片地址用。
+        return [u.strip() for u in data if isinstance(u, str) and u.strip()]
+
     def _compose_prompt_parts(
         self,
         settings: dict,
@@ -510,14 +532,42 @@ class AIReplyEngine:
 - 未经系统确认，不得声称上述操作已成功，也不得要求买家重复付款。
 - 直接输出适合发送给买家的简短回复，不要解释规则。"""
 
+        # 历史消息里带图的（买家先发图、下一轮再追问「这个能用吗」）：
+        # 按「由新到旧」分配预算，最近的图优先；assistant 的历史消息永不带图。
+        image_budget = self.MAX_HISTORY_IMAGES
+        attach = {}
+        for idx in range(len(context) - 1, -1, -1):
+            if image_budget <= 0:
+                break
+            item = context[idx]
+            if not isinstance(item, dict) or item.get("role") != "user":
+                continue
+            urls = [
+                str(u).strip()
+                for u in (item.get("images") or [])
+                if str(u or '').strip()
+            ]
+            if not urls:
+                continue
+            take = urls[:image_budget]
+            image_budget -= len(take)
+            attach[idx] = take
+
+        history_messages = []
+        for idx, msg in enumerate(context):
+            role = msg.get("role") if isinstance(msg, dict) else None
+            if role not in {"user", "assistant"}:
+                continue
+            content = msg.get("content")
+            if self.is_system_or_order_event(content):
+                continue
+            if role == "user":
+                content = self._build_user_content(content, attach.get(idx))
+            history_messages.append({"role": role, "content": content})
+
         messages = [
             {"role": "system", "content": system_prompt + safety_prompt},
-            *[
-                {"role": msg["role"], "content": msg["content"]}
-                for msg in context
-                if msg.get("role") in {"user", "assistant"}
-                and not self.is_system_or_order_event(msg.get("content"))
-            ],
+            *history_messages,
             {"role": "user", "content": self._build_user_content(message, images)},
         ]
 
@@ -774,7 +824,10 @@ class AIReplyEngine:
             logger.info(f"检测到意图: {intent} (账号: {cookie_id})")
             
             # 在锁外先保存用户消息到数据库，让所有消息都能立即保存
-            message_created_at = self.save_conversation(chat_id, cookie_id, user_id, item_id, "user", message, intent)
+            message_created_at = self.save_conversation(
+                chat_id, cookie_id, user_id, item_id, "user", message, intent,
+                images=images,
+            )
             
             # 如果调用方已经实现了去抖（debounce），可以通过 skip_wait=True 跳过内部等待
             if not skip_wait:
@@ -1006,11 +1059,11 @@ class AIReplyEngine:
             with db_manager.lock:
                 cursor = db_manager.conn.cursor()
                 cursor.execute('''
-                SELECT id, role, content, created_at FROM ai_conversations
+                SELECT id, role, content, created_at, images FROM ai_conversations
                 WHERE chat_id = ? AND cookie_id = ?
                   AND (? IS NULL OR item_id = ?)
                   AND created_at >= datetime('now', '-' || ? || ' minutes')
-                ORDER BY created_at DESC LIMIT ?
+                ORDER BY created_at DESC, id DESC LIMIT ?
                 ''', (chat_id, cookie_id, item_id, item_id, max_age_minutes, limit + 1))
                 
                 results = cursor.fetchall()
@@ -1018,7 +1071,8 @@ class AIReplyEngine:
                 context = []
                 for row in results:
                     candidate = {
-                        "id": row[0], "role": row[1], "content": row[2], "created_at": row[3]
+                        "id": row[0], "role": row[1], "content": row[2], "created_at": row[3],
+                        "images": self._parse_stored_images(row[4]),
                     }
                     if (
                         exclude_current and not skipped_current
@@ -1029,7 +1083,11 @@ class AIReplyEngine:
                         skipped_current = True
                         continue
                     if not self.is_system_or_order_event(candidate["content"]):
-                        context.append({"role": candidate["role"], "content": candidate["content"]})
+                        context.append({
+                            "role": candidate["role"],
+                            "content": candidate["content"],
+                            "images": candidate["images"],
+                        })
                 context = list(reversed(context[:limit]))
                 return context
         except Exception as e:
@@ -1037,16 +1095,23 @@ class AIReplyEngine:
             return []
     
     def save_conversation(self, chat_id: str, cookie_id: str, user_id: str, 
-                         item_id: str, role: str, content: str, intent: str = None) -> Optional[str]:
-        """保存对话记录，返回创建时间"""
+                         item_id: str, role: str, content: str, intent: str = None,
+                         images: Optional[list] = None) -> Optional[str]:
+        """保存对话记录，返回创建时间
+
+        images: 买家消息携带的图片 URL（可选），存成 JSON 数组。买家先发图、
+        下一轮再追问时靠它把图还原回上下文，否则历史里只剩 "[图片]"。
+        """
         try:
+            urls = [str(u).strip() for u in (images or []) if str(u or '').strip()]
             with db_manager.lock:
                 cursor = db_manager.conn.cursor()
                 cursor.execute('''
                 INSERT INTO ai_conversations 
-                (cookie_id, chat_id, user_id, item_id, role, content, intent)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                ''', (cookie_id, chat_id, user_id, item_id, role, content, intent))
+                (cookie_id, chat_id, user_id, item_id, role, content, intent, images)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (cookie_id, chat_id, user_id, item_id, role, content, intent,
+                      json.dumps(urls, ensure_ascii=False) if urls else None))
                 db_manager.conn.commit()
                 
                 # 获取刚插入记录的created_at

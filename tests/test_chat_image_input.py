@@ -11,11 +11,13 @@
 """
 
 import json
+import time
 import unittest
 from unittest.mock import patch
 
 from XianyuAutoAsync import XianyuLive
 from app.ai_reply_engine import AIReplyEngine
+from app.db_manager import db_manager
 
 # 真实推送帧里的 content 字段（截图实测抓下来的形态）
 REAL_IMAGE_CONTENT = json.dumps({
@@ -290,6 +292,134 @@ class TextOnlyProviderGuardTests(unittest.TestCase):
         parts = captured["contents"][-1]["parts"]
         self.assertTrue(all(isinstance(p["text"], str) for p in parts))
         self.assertIn(IMG1, parts[0]["text"])
+
+
+class StoredImagesParsingTests(unittest.TestCase):
+    def test_none_and_blank_return_empty(self):
+        for raw in (None, "", "null", "[]", "not json", '{"a":1}', '[1, 2]'):
+            with self.subTest(raw=raw):
+                self.assertEqual(AIReplyEngine._parse_stored_images(raw), [])
+
+    def test_list_of_urls_is_parsed(self):
+        raw = json.dumps([IMG1, IMG2, "  ", None])
+        self.assertEqual(AIReplyEngine._parse_stored_images(raw), [IMG1, IMG2])
+
+
+class ConversationImagesPersistenceTests(unittest.TestCase):
+    """买家发的图必须落库，否则下一轮追问时历史里只剩 "[图片]"。"""
+
+    COOKIE = "2218031692538"
+    ITEM = "__image_hist_item__"
+
+    def setUp(self):
+        self.engine = AIReplyEngine()
+        self.chat_id = f"__image_hist_{int(time.time() * 1000)}__"
+
+    def tearDown(self):
+        with db_manager.lock:
+            db_manager.conn.execute(
+                "DELETE FROM ai_conversations WHERE chat_id = ?", (self.chat_id,)
+            )
+            db_manager.conn.commit()
+
+    def _context(self):
+        return self.engine.get_conversation_context(
+            self.chat_id, self.COOKIE, item_id=self.ITEM, limit=10, max_age_minutes=10
+        )
+
+    def test_images_are_saved_and_restored(self):
+        self.engine.save_conversation(
+            self.chat_id, self.COOKIE, "buyer", self.ITEM, "user", "[图片]",
+            "default", images=[IMG1, IMG2],
+        )
+        self.engine.save_conversation(
+            self.chat_id, self.COOKIE, "buyer", self.ITEM, "assistant", "看到啦",
+            "default",
+        )
+        context = self._context()
+        self.assertEqual([m["role"] for m in context], ["user", "assistant"])
+        self.assertEqual(context[0]["images"], [IMG1, IMG2])
+        self.assertEqual(context[1]["images"], [])
+
+    def test_message_without_images_stores_null(self):
+        self.engine.save_conversation(
+            self.chat_id, self.COOKIE, "buyer", self.ITEM, "user", "你好", "default",
+        )
+        self.assertEqual(self._context()[0]["images"], [])
+        raw = db_manager.conn.execute(
+            "SELECT images FROM ai_conversations WHERE chat_id = ?", (self.chat_id,)
+        ).fetchone()[0]
+        self.assertIsNone(raw)
+
+
+class HistoryImageContextTests(unittest.TestCase):
+    """图片进历史上下文：最近的优先、有上限、assistant 永不带图。"""
+
+    SETTINGS = {
+        "custom_prompts": json.dumps({"default": "你是一位客服"}, ensure_ascii=False),
+        "max_bargain_rounds": 3,
+        "max_discount_percent": 10,
+        "max_discount_amount": 100,
+    }
+    ITEM = {"title": "DeepSeek 日卡", "price": "2", "desc": "2\u5143/\u5929"}
+
+    def setUp(self):
+        self.engine = AIReplyEngine()
+
+    def _parts(self, context, images=None):
+        return self.engine._compose_prompt_parts(
+            settings=self.SETTINGS, intent="default", item_info=self.ITEM,
+            message="\u8fd9\u4e2a\u80fd\u7528\u5417", context=context, bargain_count=0, images=images,
+        )
+
+    def _history(self, parts):
+        msgs = parts["messages"]
+        return msgs[1:-1]  # 去掉 system 与最后一条当前消息
+
+    def test_historical_user_image_is_restored(self):
+        context = [
+            {"role": "user", "content": "[\u56fe\u7247]", "images": [IMG1]},
+            {"role": "assistant", "content": "\u770b\u5230\u5566"},
+        ]
+        history = self._history(self._parts(context))
+        self.assertIsInstance(history[0]["content"], list)
+        self.assertEqual(history[0]["content"][1]["image_url"]["url"], IMG1)
+        self.assertIsInstance(history[1]["content"], str)
+
+    def test_assistant_history_never_carries_images(self):
+        context = [{"role": "assistant", "content": "\u597d\u7684", "images": [IMG1]}]
+        history = self._history(self._parts(context))
+        self.assertIsInstance(history[0]["content"], str)
+
+    def test_budget_prefers_newest_and_is_capped(self):
+        context = [
+            {"role": "user", "content": "\u65e7\u56fe1", "images": [IMG1]},
+            {"role": "assistant", "content": "\u55ef"},
+            {"role": "user", "content": "\u65e7\u56fe2", "images": [IMG2]},
+        ]
+        history = self._history(self._parts(context))
+        # MAX_HISTORY_IMAGES = 2：两张历史图都放得下，但最旧的先被分配
+        with_images = [m for m in history if isinstance(m["content"], list)]
+        self.assertEqual(len(with_images), 2)
+
+        # 收紧预算到 1 时，只能是最新的那张
+        original = AIReplyEngine.MAX_HISTORY_IMAGES
+        AIReplyEngine.MAX_HISTORY_IMAGES = 1
+        try:
+            history = self._history(self._parts(context))
+        finally:
+            AIReplyEngine.MAX_HISTORY_IMAGES = original
+        with_images = [m for m in history if isinstance(m["content"], list)]
+        self.assertEqual(len(with_images), 1)
+        self.assertEqual(with_images[0]["content"][1]["image_url"]["url"], IMG2)
+
+    def test_history_without_images_is_all_plain_text(self):
+        context = [
+            {"role": "user", "content": "\u4f60\u597d", "images": []},
+            {"role": "assistant", "content": "\u60a8\u597d"},
+        ]
+        for msg in self._history(self._parts(context)):
+            self.assertIsInstance(msg["content"], str)
 
 
 if __name__ == "__main__":
