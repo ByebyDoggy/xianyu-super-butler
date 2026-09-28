@@ -1770,9 +1770,96 @@ class XianyuLive:
 
         return result
 
+    def _chat_id_from_red_reminder(self, message) -> str:
+        """红点提醒帧里的会话 ID。
+
+        红点提醒的 message['1'] 是字符串形态的会话标识（形如
+        67428810545@goofish），里面的数字是**会话 ID**、不是买家 user id ——
+        这两者在本项目里被搞混过多次，别再把会话 ID 当买家 ID 用。
+        """
+        message_1 = message.get("1") if isinstance(message, dict) else None
+        if isinstance(message_1, str) and message_1:
+            return message_1.split("@")[0].split(":")[-1]
+        if isinstance(message_1, dict):
+            raw = message_1.get("2") or message_1.get("1")
+            if isinstance(raw, str) and raw:
+                return raw.split("@")[0]
+        return ""
+
+    async def _handle_paid_red_reminder(self, websocket, message, msg_time: str):
+        """处理 redReminder=等待卖家发货 的红点提醒：补一次自动发货。
+
+        平台有两种形态的「买家已付款」通知：
+          1. 聊天里的卡片消息 [我已付款，等待你发货]（_is_auto_delivery_trigger 认它）
+          2. redReminder=等待卖家发货 的红点提醒
+        实测两种都会出现，只认卡片就会静默漏单 —— 订单 3316466102195066871
+        就是只收到红点提醒，日志里只留下一行「【系统】交易成功 ... 等待卖家发货」
+        然后落到「非聊天消息」直接返回，卡券根本没发。
+
+        红点提醒里没有订单号、只有会话 ID，所以按 (账号, 会话) 找最近一笔未系统
+        发货的订单，再交给统一的自动发货流程（后者还会再到平台确认一遍 pending_ship）。
+        """
+        try:
+            from app.db_manager import db_manager
+
+            chat_id = self._chat_id_from_red_reminder(message)
+            if not chat_id:
+                logger.warning(
+                    f'[{msg_time}] 【{self.cookie_id}】等待卖家发货提醒里没有会话 ID，跳过自动发货'
+                )
+                return
+
+            # 红点提醒有时比交易卡片先到，订单快照可能还没落库，稍等重查几次
+            order = None
+            for attempt in range(3):
+                order = db_manager.get_latest_pending_order_by_chat(self.cookie_id, chat_id)
+                if order:
+                    break
+                if attempt < 2:
+                    await asyncio.sleep(2)
+
+            if not order:
+                logger.info(
+                    f'[{msg_time}] 【{self.cookie_id}】等待卖家发货提醒：会话 {chat_id} '
+                    f'本地没有待发货订单，跳过（等订单同步补上）'
+                )
+                return
+
+            order_id = str(order.get("order_id") or "")
+            buyer_id = str(order.get("buyer_id") or "")
+            item_id = str(order.get("item_id") or "")
+            if not order_id:
+                return
+            if order.get("system_shipped"):
+                logger.info(f'[{msg_time}] 【{self.cookie_id}】订单 {order_id} 已系统发货，跳过')
+                return
+
+            logger.info(
+                f'[{msg_time}] 【{self.cookie_id}】等待卖家发货提醒 → 会话 {chat_id} '
+                f'定位到待发货订单 {order_id}（买家 {buyer_id}），进入自动发货'
+            )
+            await self._handle_auto_delivery(
+                websocket,
+                message,
+                buyer_id,
+                buyer_id,
+                item_id,
+                chat_id,
+                msg_time,
+                order_id=order_id,
+            )
+        except Exception as e:
+            logger.error(
+                f'[{msg_time}] 【{self.cookie_id}】处理等待卖家发货提醒失败: {self._safe_str(e)}'
+            )
+
     async def _handle_auto_delivery(self, websocket, message: dict, send_user_name: str, send_user_id: str,
-                                   item_id: str, chat_id: str, msg_time: str):
-        """统一处理自动发货逻辑"""
+                                   item_id: str, chat_id: str, msg_time: str, order_id: str = None):
+        """统一处理自动发货逻辑
+
+        order_id: 调用方已经知道订单号时直接传入。红点提醒那类消息里没有订单号，
+        只有会话 ID，需要由调用方先反查出订单再调进来。
+        """
         try:
             # 检查商品是否属于当前cookies
             if item_id and item_id != "未知商品":
@@ -1793,8 +1880,8 @@ class XianyuLive:
                 except Exception as e:
                     logger.error(f'[{msg_time}] 【{self.cookie_id}】检查商品归属失败: {self._safe_str(e)}，继续按订单归属校验')
 
-            # 提取订单ID
-            order_id = self._extract_order_id(message)
+            # 提取订单ID（调用方已知就直接用：红点提醒里没有订单号）
+            order_id = order_id or self._extract_order_id(message)
 
             # 如果order_id不存在，直接返回
             if not order_id:
@@ -10453,7 +10540,11 @@ class XianyuLive:
                 elif red_reminder == '等待卖家发货':
                     user_url = f'https://www.goofish.com/personal?userId={user_id}'
                     logger.info(f'[{msg_time}] 【系统】交易成功 {user_url} 等待卖家发货')
-                    # return
+                    # 这条红点提醒就是「买家已付款」的另一种形态。平台有时只推它、
+                    # 不推聊天里的 [我已付款，等待你发货] 卡片，只认卡片会静默漏单
+                    # （实测订单 3316466102195066871）。这里补一次自动发货。
+                    await self._handle_paid_red_reminder(websocket, message, msg_time)
+                    return
             except:
                 pass
 

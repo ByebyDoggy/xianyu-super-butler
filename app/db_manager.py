@@ -6842,6 +6842,46 @@ class DBManager:
                 logger.error(f"获取订单信息失败: item_id={item_id}, buyer_id={buyer_id} - {e}")
                 return None
 
+    def get_latest_pending_order_by_chat(self, cookie_id: str, chat_id: str):
+        """按 (账号, 会话) 找最近一笔还没系统发货的待发货订单。
+
+        用途：平台有时只推 redReminder=等待卖家发货 的红点提醒（没有订单号，
+        只有会话 ID），需要靠会话反查订单才能自动发货。
+        """
+        if not cookie_id or not chat_id:
+            return None
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute('''
+                SELECT order_id, item_id, buyer_id, order_status, cookie_id, chat_id,
+                       COALESCE(system_shipped, 0), created_at
+                FROM orders
+                WHERE cookie_id = ? AND chat_id = ?
+                  AND COALESCE(system_shipped, 0) = 0
+                  AND order_status IN ('pending_ship', 'processing', 'unknown')
+                ORDER BY created_at DESC, order_id DESC
+                LIMIT 1
+                ''', (cookie_id, chat_id))
+                row = cursor.fetchone()
+                if not row:
+                    return None
+                return {
+                    'id': row[0],
+                    'order_id': row[0],
+                    'item_id': row[1],
+                    'buyer_id': row[2],
+                    'order_status': row[3],
+                    'status': row[3],
+                    'cookie_id': row[4],
+                    'chat_id': row[5],
+                    'system_shipped': bool(row[6]),
+                    'created_at': row[7],
+                }
+            except Exception as e:
+                logger.error(f"按会话查待发货订单失败: {cookie_id}/{chat_id} - {e}")
+                return None
+
     def get_orders_by_cookie(self, cookie_id: str, limit: int = 100):
         """根据Cookie ID获取订单列表"""
         with self.lock:
