@@ -132,13 +132,13 @@ const About: React.FC = () => {
           <div className="flex min-w-0 flex-col gap-1.5">
             <span className="text-xs font-semibold text-gray-500">开源仓库</span>
             <a
-              href="https://github.com/23Star/xianyu-super-butler"
+              href="https://github.com/ByebyDoggy/xianyu-super-butler"
               target="_blank"
               rel="noopener noreferrer"
               className="inline-flex min-w-0 items-center gap-1.5 text-xs font-bold text-[#8c7900] hover:underline"
             >
               <Github className="h-3.5 w-3.5 shrink-0" />
-              <span className="truncate">23Star/xianyu-super-butler</span>
+              <span className="truncate">ByebyDoggy/xianyu-super-butler</span>
               <ExternalLink className="h-3 w-3 shrink-0" />
             </a>
           </div>

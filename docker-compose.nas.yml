@@ -17,7 +17,7 @@
 
 services:
   xianyu-app:
-    image: ghcr.io/23star/xianyu-super-butler:latest
+    image: ghcr.io/byebydoggy/xianyu-super-butler:latest
     container_name: xianyu-super-butler
     restart: unless-stopped
     ports:

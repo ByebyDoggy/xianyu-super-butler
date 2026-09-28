@@ -36,11 +36,11 @@ COPY --from=frontend-builder /frontend/dist ./static
 
 FROM base AS runtime
 
-LABEL maintainer="23Star" \
+LABEL maintainer="ByebyDoggy" \
       version="3.0.0-beta" \
       description="Xianyu account, item, order, reply, and delivery management" \
-      repository="https://github.com/23Star/xianyu-super-butler" \
-      author="23Star"
+      repository="https://github.com/ByebyDoggy/xianyu-super-butler" \
+      author="ByebyDoggy"
 
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \

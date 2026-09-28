@@ -2,8 +2,8 @@
 
 面向闲鱼卖家的账号、商品、订单、消息、自动回复与自动发货一体化管理系统。
 
-[![GitHub Stars](https://img.shields.io/github/stars/23Star/xianyu-super-butler?style=flat&logo=github&color=f5b301)](https://github.com/23Star/xianyu-super-butler/stargazers)
-[![Version](https://img.shields.io/badge/Version-3.1.0-52c41a)](https://github.com/23Star/xianyu-super-butler/releases)
+[![GitHub Stars](https://img.shields.io/github/stars/ByebyDoggy/xianyu-super-butler?style=flat&logo=github&color=f5b301)](https://github.com/ByebyDoggy/xianyu-super-butler/stargazers)
+[![Version](https://img.shields.io/badge/Version-3.1.0-52c41a)](https://github.com/ByebyDoggy/xianyu-super-butler/releases)
 [![Python](https://img.shields.io/badge/Python-3.11+-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![React](https://img.shields.io/badge/React-19-149ECA?logo=react&logoColor=white)](https://react.dev/)
 [![License](https://img.shields.io/badge/License-AGPL--3.0-222222)](LICENSE)
@@ -94,7 +94,7 @@ docker run -d --name xianyu-butler \
   -e ADMIN_USERNAME=admin \
   -e ADMIN_PASSWORD=改成你自己的密码 \
   --restart unless-stopped \
-  ghcr.io/23star/xianyu-super-butler:latest
+  ghcr.io/byebydoggy/xianyu-super-butler:latest
 ```
 
 浏览器打开 `http://服务器IP:8080` 即可。数据都在当前目录的 `data` / `logs` / `backups` 里，
@@ -105,7 +105,7 @@ Windows PowerShell 把 `$(pwd)` 换成 `${PWD}`，续行的 `\` 换成反引号 
 ### Docker Compose（推荐长期使用）
 
 ```bash
-git clone https://github.com/23Star/xianyu-super-butler.git
+git clone https://github.com/ByebyDoggy/xianyu-super-butler.git
 cd xianyu-super-butler
 docker compose -f docker-compose.nas.yml up -d
 ```
@@ -150,7 +150,7 @@ docker compose -f docker-compose-cn.yml up -d --build
 需要 Python 3.11+、Node.js 20+、npm。
 
 ```bash
-git clone https://github.com/23Star/xianyu-super-butler.git
+git clone https://github.com/ByebyDoggy/xianyu-super-butler.git
 cd xianyu-super-butler
 
 py -3.11 -m venv .venv
@@ -202,7 +202,7 @@ git pull && docker compose up -d --build
   </tr>
 </table>
 
-缺陷和功能建议请提交到 [GitHub Issues](https://github.com/23Star/xianyu-super-butler/issues)。
+缺陷和功能建议请提交到 [GitHub Issues](https://github.com/ByebyDoggy/xianyu-super-butler/issues)。
 
 ## 许可与声明
 
@@ -214,18 +214,12 @@ git pull && docker compose up -d --build
 
 ## Star History
 
-<a href="https://www.star-history.com/?type=date&repos=23Star%2Fxianyu-super-butler">
+<a href="https://www.star-history.com/#ByebyDoggy/xianyu-super-butler&Date">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=23Star/xianyu-super-butler&type=date&theme=dark&legend=top-left&sealed_token=AhEE4dCbaUSe6lOSCJhYlDz04x4r2C14buYVYWlJVlulk23LKk5DgHZfMIumVkiNUPsbFO--8IX-0pXCfW8nyyEN3NStTE-16pBQggRCq6gsUZRlegeZdTbWWU-UPKWAWlnyyQyndGhz-lPX0HJrKxSCriOB1fiyJljBO7eNsd4xVYkrByhViWaPMCv9" />
-    <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=23Star/xianyu-super-butler&type=date&legend=top-left&sealed_token=AhEE4dCbaUSe6lOSCJhYlDz04x4r2C14buYVYWlJVlulk23LKk5DgHZfMIumVkiNUPsbFO--8IX-0pXCfW8nyyEN3NStTE-16pBQggRCq6gsUZRlegeZdTbWWU-UPKWAWlnyyQyndGhz-lPX0HJrKxSCriOB1fiyJljBO7eNsd4xVYkrByhViWaPMCv9" />
-    <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=23Star/xianyu-super-butler&type=date&legend=top-left&sealed_token=AhEE4dCbaUSe6lOSCJhYlDz04x4r2C14buYVYWlJVlulk23LKk5DgHZfMIumVkiNUPsbFO--8IX-0pXCfW8nyyEN3NStTE-16pBQggRCq6gsUZRlegeZdTbWWU-UPKWAWlnyyQyndGhz-lPX0HJrKxSCriOB1fiyJljBO7eNsd4xVYkrByhViWaPMCv9" />
+    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=ByebyDoggy/xianyu-super-butler&type=Date&theme=dark" />
+    <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=ByebyDoggy/xianyu-super-butler&type=Date" />
+    <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=ByebyDoggy/xianyu-super-butler&type=Date" />
   </picture>
 </a>
 
 Star 历史曲线实时读取 GitHub 数据，不需要人工更新。
-
-## Fork 网络总 Star
-
-[![Fork Network Stars](docs/fork-network-stars.svg)](https://github.com/23Star/xianyu-super-butler/network/members)
-
-该统计在主仓库 Star 之外累加全部公开 Fork 获得的 Star，每 6 小时自动刷新。由于同一用户可能同时 Star 多个仓库，此处是各仓库 Star 数之和，并非去重后的独立用户数。

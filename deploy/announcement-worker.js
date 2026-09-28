@@ -166,7 +166,7 @@ textarea{min-height:64px;resize:vertical}
     <div class="row">
       <div><label>最新版本号</label><input id="ver" placeholder="1.1.0">
         <div class="hint">高于客户端本地版本才会提示更新</div></div>
-      <div><label>下载地址</label><input id="url" placeholder="https://github.com/23Star/xianyu-super-butler/releases">
+      <div><label>下载地址</label><input id="url" placeholder="https://github.com/ByebyDoggy/xianyu-super-butler/releases">
         <div class="hint">必须 https 开头</div></div>
     </div>
     <label>更新说明</label><textarea id="notes" placeholder="修复了哪些问题"></textarea>
