@@ -239,15 +239,37 @@ class HandleCaptchaAutoOpenWiringTests(unittest.IsolatedAsyncioTestCase):
         return live
 
     async def test_slider_event_spawns_auto_open(self):
+        import XianyuAutoAsync as mod
+
         live = self._live()
         url = 'https://h5api.m.goofish.com/punish?x5secdata=abc'
         await live._handle_captcha_verification({'data': {'url': url}})
-        # 自动弹窗是后台任务（asyncio.create_task 只调度不执行），
-        # 让事件循环把挂起的任务跑完再断言
-        pending = [t for t in live.background_tasks if not t.done()]
+        # 自动弹窗是「脱钩」后台任务（不进 background_tasks，这样账号任务重启
+        # 也不会把人工验证的浏览器连带取消掉），让事件循环跑完再断言。
+        pending = [t for t in mod._DETACHED_BROWSER_TASKS if not t.done()]
         if pending:
-            await asyncio.gather(*pending)
+            await asyncio.gather(*pending, return_exceptions=True)
         live._auto_open_slider_browser.assert_awaited_once_with(url)
+        # 脱钩任务不能污染 background_tasks，否则 main() 收尾时会取消它
+        self.assertFalse(live._auto_open_slider_browser.side_effect)
+
+    async def test_auto_open_task_is_detached_from_instance(self):
+        """回归：人工验证任务不能挂进 background_tasks。
+
+        2026-09-29 事故：弹窗 13:44:55 开、13:45:09 就被关（用户同时点了
+        「本地浏览器登录」导致账号任务重启），根因是 main() 收尾时
+        gather(*background_tasks) 被 cancel 传导，把滑块浏览器一起关了。
+        """
+        import XianyuAutoAsync as mod
+
+        live = self._live()
+        await live._handle_captcha_verification(
+            {'data': {'url': 'https://h5api.m.goofish.com/punish'}}
+        )
+        self.assertEqual(live.background_tasks, set())
+        pending = [t for t in mod._DETACHED_BROWSER_TASKS if not t.done()]
+        self.assertTrue(pending)
+        await asyncio.gather(*pending, return_exceptions=True)
 
     async def test_disabled_when_auto_open_off(self):
         live = self._live()

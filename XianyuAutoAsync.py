@@ -197,6 +197,24 @@ except (TypeError, ValueError):
 # 刷 Cookie 只需要页面跑一次 mtop，首页就能拿到同样的 session cookie，不需要 IM。
 COOKIE_REFRESH_PAGE_URL = "https://www.goofish.com/"
 
+# 人工滑块验证（有头浏览器）的任务脱钩登记处。
+#
+# 绝对不能把人工验证任务挂到实例的 background_tasks 里：main() 的 finally 会
+# `asyncio.wait_for(gather(*background_tasks))`，而主任务被 cancel 时这个 await
+# 会立刻抛 CancelledError 并传导给被 gather 的任务 —— 人工过滑块的浏览器会当场
+# 被关掉。实测事故：13:44:55 弹出滑块浏览器，13:45:09 就被关（用户同时点了
+# 「本地浏览器登录」导致账号任务重启），用户根本来不及拖，于是「过了滑块也不
+# 恢复」。这里用模块级 set 持有引用，任务不随实例生死。
+_DETACHED_BROWSER_TASKS = set()
+
+
+def _spawn_detached(coro):
+    """启动一个不随实例（账号任务重启）被取消的后台任务。"""
+    task = asyncio.create_task(coro)
+    _DETACHED_BROWSER_TASKS.add(task)
+    task.add_done_callback(_DETACHED_BROWSER_TASKS.discard)
+    return task
+
 class XianyuLive:
     # 类级别的锁字典，为每个order_id维护一个锁（用于自动发货）
     _order_locks = defaultdict(lambda: asyncio.Lock())
@@ -2897,11 +2915,30 @@ class XianyuLive:
 
         # 验证过了就该马上恢复：① 若正在等「N 秒后重连」则打断它；
         # ② 若连接还活着则主动断开，让 main 用新 Cookie 重新 /reg。
+        #
+        # 注意：人工验证期间用户可能又去点了一次「本地浏览器登录」，账号任务会
+        # 被重启、self 很可能已经不是当前运行的那个实例（2026-09-29 事故）。
+        # 所以这里必须对「当前活着的实例」生效，而不是无脑对自己生效。
+        target = self
         try:
-            self._reconnect_now.set()
+            from app.cookie_manager import manager as cookie_manager
+            manager = getattr(cookie_manager, 'manager', None)
+            if manager is not None:
+                live = manager.instances.get(self.cookie_id)
+                if live is not None:
+                    target = live
         except Exception:
             pass
-        await self._force_ws_reconnect("人工验证完成")
+        if target is not self:
+            logger.info(f"【{self.cookie_id}】账号任务已重启，改为通知当前实例立即重连")
+        try:
+            target._reconnect_now.set()
+        except Exception:
+            pass
+        try:
+            await target._force_ws_reconnect("人工验证完成")
+        except Exception as e:
+            logger.warning(f"【{self.cookie_id}】触发立即重连失败: {self._safe_str(e)}")
         return cleaned
 
     async def _auto_open_slider_browser(self, verification_url: str = None):
@@ -3011,7 +3048,10 @@ class XianyuLive:
                 # 自动弹出本项目浏览器等人工验证。原来只发通知就 return，
                 # 结果用户在自己电脑上过滑块（另一份会话）无效，账号一直卡死。
                 if self.auto_open_slider_browser:
-                    self._create_tracked_task(
+                    # 必须脱钩启动：见 _DETACHED_BROWSER_TASKS 的注释。
+                    # 挂到 background_tasks 里的话，账号任务一重启（用户重新扫码 /
+                    # 更新 Cookie 都会触发）就会被连带取消，浏览器当场关闭。
+                    _spawn_detached(
                         self._auto_open_slider_browser(verification_url)
                     )
 
