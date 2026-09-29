@@ -29,6 +29,13 @@ SETTLE_SECONDS = 15            # 拿到 unb 后再等一会，让平台把配套
 # 不能每 2 秒来一发（会把刚登录的账号又推进风控）。
 VERIFY_INTERVAL = 15
 
+# 正在等待人工完成验证的登录窗口：{label: 打开时间}。
+#
+# 保留窗口是为了让用户在同一个浏览器里过完滑块（不再新开一个），但它会占着
+# profile，导致后续点击看起来“没反应”（2026-09-29 实测）。这里登记下来，
+# 便于后续请求直接给出明确提示，而不是默默等锁。
+_PENDING_VERIFICATION_WINDOWS: Dict[str, float] = {}
+
 
 async def _start_playwright():
     """优先 patchright（能把 navigator.webdriver 从 true 变成 false）。"""
@@ -84,6 +91,16 @@ def _session_usable_from_token_response(payload: dict) -> bool:
         if isinstance(url, str) and ('punish' in url or 'action=captcha' in url):
             return True
     return False
+
+
+def pending_verification_window(label: str) -> Optional[float]:
+    """返回正在等待人工验证的窗口打开时间（None = 没有）。"""
+    return _PENDING_VERIFICATION_WINDOWS.get(label)
+
+
+def clear_pending_verification_window(label: str) -> None:
+    """人工验证结束后清除登记（窗口已关闭）。"""
+    _PENDING_VERIFICATION_WINDOWS.pop(label, None)
 
 
 async def _captcha_pending(context, page) -> bool:
@@ -263,10 +280,24 @@ async def open_login_session(
         'profile_dir': profile_path,
     }
 
+    # 已有窗口在等人工过验证时，直接说清楚，不要默默等锁（用户会以为“点了没
+    # 反应”）。这类窗口本身就占着 profile，再开一个也开不出来。
+    pending_since = pending_verification_window(label)
+    if pending_since is not None:
+        waited = int(time.time() - pending_since)
+        result['message'] = (
+            f'已有一个验证码窗口打开着（{waited} 秒前），'
+            f'请先在那个窗口里完成验证；若那个窗口已经关了，请稍后重试'
+        )
+        logger.warning(f'【{label}】{result["message"]}')
+        return result
+
     try:
         # 同一账号的 profile 是独占的：已经有别的流程在用它（过验证、取订单…）时，
         # 宁可现在就说清楚，也不要开出第二个浏览器把 profile 弄成半损坏状态。
-        await acquire_profile_async(cookie_id or None, '本地浏览器登录')
+        # 但等锁上限要短：人工验证窗口会长期占着 profile，等 300 秒只会让用户
+        # 以为“点了没反应”（2026-09-29 实测：两次点击各卡了 5 分钟）。
+        await acquire_profile_async(cookie_id or None, '本地浏览器登录', timeout=20)
         profile_held = True
 
         playwright, engine = await _start_playwright()
@@ -384,6 +415,7 @@ async def open_login_session(
             result['keep_open'] = True
             result['context'] = context
             result['page'] = page
+            _PENDING_VERIFICATION_WINDOWS[label] = time.time()
             logger.warning(
                 f'【{label}】检测到验证码/风控，保留本窗口交给人工验证'
                 f'（不关闭、不新开浏览器）'

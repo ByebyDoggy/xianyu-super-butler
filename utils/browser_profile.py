@@ -28,7 +28,7 @@ import os
 import shutil
 import threading
 from contextlib import contextmanager
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from loguru import logger
 
@@ -273,18 +273,28 @@ def hold_profile(cookie_id: Any, purpose: str = '浏览器任务'):
         release_profile(cookie_id, purpose)
 
 
-async def acquire_profile_async(cookie_id: Any, purpose: str = '浏览器任务') -> None:
+async def acquire_profile_async(
+    cookie_id: Any,
+    purpose: str = '浏览器任务',
+    timeout: Optional[float] = None,
+) -> None:
     """异步占用该账号的 profile（在线程里等锁，不阻塞事件循环）。
 
     取到后必须调用 release_profile_async 归还。
+
+    timeout: 等锁秒数，默认 PROFILE_ACQUIRE_TIMEOUT。调用方若希望“拿不到就
+        立刻告诉用户”可以传小值 —— 人工验证窗口会长期占着 profile，等 300 秒
+        只会让用户以为“点了没反应”（2026-09-29 实测）。
     """
+    wait = PROFILE_ACQUIRE_TIMEOUT if timeout is None else timeout
     lock = profile_lock(cookie_id)
-    acquired = await asyncio.to_thread(lock.acquire, True, PROFILE_ACQUIRE_TIMEOUT)
+    acquired = await asyncio.to_thread(lock.acquire, True, wait)
     if not acquired:
         raise TimeoutError(
             f'{purpose}: 账号 {cookie_id or "新账号"} 的浏览器 profile 被其他任务占用'
-            f'超过 {PROFILE_ACQUIRE_TIMEOUT} 秒。'
-            '同一账号不能同时开两个浏览器（持久化目录是独占的），请等上一个任务结束。'
+            f'超过 {wait} 秒。'
+            '同一账号不能同时开两个浏览器（持久化目录是独占的），'
+            '请先关掉已打开的登录/验证窗口，或等上一个任务结束。'
         )
 
 

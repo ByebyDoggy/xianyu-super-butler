@@ -110,3 +110,46 @@ class HandoffFlagTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class NoSilentProfileHangTests(unittest.TestCase):
+    """回归：不能因为窗口占着 profile 就让用户“点了没反应”。
+
+    2026-09-29 实测：保留的验证窗口占着 profile，后续两次点击各卡 300 秒
+    且日志里毫无输出，用户完全不知道发生了什么。
+    """
+
+    def test_pending_window_short_circuits_with_message(self):
+        import time
+
+        from utils import browser_login as B
+
+        label = '新账号'
+        B._PENDING_VERIFICATION_WINDOWS[label] = time.time() - 30
+        try:
+            info = asyncio.run(B.open_login_session(cookie_id=None, timeout=10))
+        finally:
+            B._PENDING_VERIFICATION_WINDOWS.pop(label, None)
+        self.assertFalse(info['success'])
+        self.assertIn('已有一个验证码窗口打开着', info['message'])
+        self.assertIn('30 秒前', info['message'])
+
+    def test_no_pending_window_proceeds(self):
+        from utils import browser_login as B
+
+        self.assertIsNone(B.pending_verification_window('不存在的账号'))
+
+    def test_acquire_profile_supports_short_timeout(self):
+        import inspect
+
+        from utils.browser_profile import acquire_profile_async
+
+        sig = inspect.signature(acquire_profile_async)
+        self.assertIn('timeout', sig.parameters)
+        self.assertIsNone(sig.parameters['timeout'].default)
+
+    def test_login_uses_short_lock_timeout(self):
+        import pathlib
+
+        src = pathlib.Path('utils/browser_login.py').read_text(encoding='utf-8')
+        self.assertIn('本地浏览器登录\', timeout=', src)

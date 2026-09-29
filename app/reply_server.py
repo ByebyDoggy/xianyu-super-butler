@@ -3321,6 +3321,12 @@ async def browser_login_with_local_browser(
             finally:
                 # 验证结束（无论成败）才关闭这个窗口
                 try:
+                    from utils.browser_login import clear_pending_verification_window
+
+                    clear_pending_verification_window(target or '新账号')
+                except Exception:
+                    pass
+                try:
                     if kept_context is not None:
                         await kept_context.close()
                     if kept_page is not None:
