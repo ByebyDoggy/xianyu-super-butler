@@ -199,6 +199,10 @@ class AutoOpenSliderBrowserTests(unittest.IsolatedAsyncioTestCase):
         import XianyuAutoAsync as mod
 
         mod._CAPTCHA_AUTO_OPEN_AT.pop(live.cookie_id, None)
+        # 归还验证窗口持有权，否则上一个用例持有中会把本用例挡掉
+        from utils import captcha_owner
+
+        captcha_owner.release(live.cookie_id)
         return live
 
     async def test_opens_browser_and_applies_cookie(self):
@@ -242,6 +246,10 @@ class AutoOpenSliderBrowserTests(unittest.IsolatedAsyncioTestCase):
         mod._CAPTCHA_AUTO_OPEN_AT[live.cookie_id] = (
             time.time() - mod.CAPTCHA_AUTO_OPEN_COOLDOWN - 1
         )
+        # 持有权也要归还：本用例走的是“冷却”这道门，不是“唯一持有者”那道门
+        from utils import captcha_owner
+
+        captcha_owner.release(live.cookie_id)
         with patch('utils.manual_captcha.open_manual_session', AsyncMock(
                 return_value={'success': False, 'cookies_str': 'old',
                               'message': '没完成'})) as om2:

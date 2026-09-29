@@ -153,3 +153,48 @@ class NoSilentProfileHangTests(unittest.TestCase):
 
         src = pathlib.Path('utils/browser_login.py').read_text(encoding='utf-8')
         self.assertIn('本地浏览器登录\', timeout=', src)
+
+
+class CaptchaOwnerLockTests(unittest.TestCase):
+    """回归：同一账号同时只能有一个流程持有验证窗口。
+
+    2026-09-29 17:37 实测：登录接口、扫码增强、后台 auto_open 三条路径
+    同时操作同一个 page，互相导航导致滑块永远出不来、原窗口被关。
+    """
+
+    def setUp(self):
+        from utils import captcha_owner
+
+        self.owner = captcha_owner
+        self.owner.release('acct')
+
+    def tearDown(self):
+        self.owner.release('acct')
+
+    def test_only_one_claim_wins(self):
+        self.assertTrue(self.owner.claim('acct', '登录窗口验证'))
+        self.assertFalse(self.owner.claim('acct', '后台自动弹窗'))
+        self.assertFalse(self.owner.claim('acct', '扫码Cookie增强'))
+        self.assertEqual(self.owner.holder('acct'), '登录窗口验证')
+
+    def test_release_by_wrong_owner_is_ignored(self):
+        self.owner.claim('acct', 'A')
+        self.owner.release('acct', 'B')
+        self.assertEqual(self.owner.holder('acct'), 'A')
+
+    def test_release_then_reclaim(self):
+        self.owner.claim('acct', 'A')
+        self.owner.release('acct', 'A')
+        self.assertIsNone(self.owner.holder('acct'))
+        self.assertTrue(self.owner.claim('acct', 'B'))
+
+    def test_describe_mentions_holder(self):
+        self.owner.claim('acct', '登录窗口验证')
+        self.assertIn('登录窗口验证', self.owner.describe('acct'))
+
+    def test_auto_open_respects_owner(self):
+        import pathlib
+
+        src = pathlib.Path('XianyuAutoAsync.py').read_text(encoding='utf-8')
+        self.assertIn('captcha_owner.claim', src)
+        self.assertIn('跳过自动弹窗', src)

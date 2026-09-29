@@ -2993,6 +2993,17 @@ class XianyuLive:
         if self.manual_captcha_in_progress:
             logger.info(f"【{self.cookie_id}】人工验证已在进行，跳过重复开启")
             return
+        # 唯一持有者检查：登录接口/扫码增强可能正在同一个 window 里做验证。
+        # 后台 auto_open 再开一个会让两者互相导航、滑块永远出不来
+        # （2026-09-29 17:37 实测：两个会话抢同一个 page）。
+        from utils import captcha_owner
+
+        if not captcha_owner.claim(self.cookie_id, '后台自动弹窗'):
+            logger.info(
+                f"【{self.cookie_id}】已有验证流程在进行（{captcha_owner.describe(self.cookie_id)}），"
+                f"跳过自动弹窗，避免多个会话争抢同一个浏览器"
+            )
+            return
         # 跨实例冷却：实例会随重连重建，实例级标志拦不住重复弹窗。
         last_open = _CAPTCHA_AUTO_OPEN_AT.get(self.cookie_id, 0.0)
         since = time.time() - last_open
@@ -3038,6 +3049,13 @@ class XianyuLive:
             logger.error(f"【{self.cookie_id}】自动弹出滑块浏览器失败: {self._safe_str(e)}")
         finally:
             self.manual_captcha_in_progress = False
+            # 归还唯一持有者占位，让后续其他流程能接手（否则会永久卡住）
+            try:
+                from utils import captcha_owner
+
+                captcha_owner.release(self.cookie_id, '后台自动弹窗')
+            except Exception:
+                pass
 
     async def _handle_captcha_verification(self, res_json: dict) -> str:
         """处理滑块验证，返回新的cookies字符串"""
@@ -9086,29 +9104,40 @@ class XianyuLive:
                 if self._needs_captcha_now():
                     handed_off_to_manual = True
                     try:
+                        from utils import captcha_owner
                         from utils.manual_captcha import open_manual_session
 
-                        logger.warning(
-                            f"【{target_cookie_id}】当前账号处于风控，"
-                            f"复用本窗口继续人工过滑块（不新开浏览器）"
-                        )
-                        result = await open_manual_session(
-                            target_cookie_id,
-                            real_cookies_str,
-                            timeout=self.slider_manual_timeout,
-                            reuse_context=context,
-                        )
-                        if result.get('success'):
-                            await self._apply_manual_captcha_cookies(result['cookies_str'])
-                            self.current_token = None
-                            logger.warning(
-                                f"【{target_cookie_id}】同窗口人工验证完成，新 Cookie 已生效"
+                        if not captcha_owner.claim(target_cookie_id, '扫码Cookie增强'):
+                            logger.info(
+                                f"【{target_cookie_id}】已有验证流程在进行"
+                                f"（{captcha_owner.describe(target_cookie_id)}），"
+                                f"本流程不再重复发起人工验证"
                             )
                         else:
-                            logger.warning(
-                                f"【{target_cookie_id}】同窗口人工验证未完成: "
-                                f"{result.get('message') or '未知原因'}"
-                            )
+                            try:
+                                logger.warning(
+                                    f"【{target_cookie_id}】当前账号处于风控，"
+                                    f"复用本窗口继续人工过滑块（不新开浏览器）"
+                                )
+                                result = await open_manual_session(
+                                    target_cookie_id,
+                                    real_cookies_str,
+                                    timeout=self.slider_manual_timeout,
+                                    reuse_context=context,
+                                )
+                                if result.get('success'):
+                                    await self._apply_manual_captcha_cookies(result['cookies_str'])
+                                    self.current_token = None
+                                    logger.warning(
+                                        f"【{target_cookie_id}】同窗口人工验证完成，新 Cookie 已生效"
+                                    )
+                                else:
+                                    logger.warning(
+                                        f"【{target_cookie_id}】同窗口人工验证未完成: "
+                                        f"{result.get('message') or '未知原因'}"
+                                    )
+                            finally:
+                                captcha_owner.release(target_cookie_id, '扫码Cookie增强')
                     except Exception as exc:
                         logger.error(
                             f"【{target_cookie_id}】同窗口人工验证失败: {self._safe_str(exc)}"

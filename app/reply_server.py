@@ -3270,10 +3270,22 @@ async def browser_login_with_local_browser(
         kept_page = info.get('page')
 
         async def _manual_then_close():
+            from utils import captcha_owner
+
             try:
                 from utils.manual_captcha import open_manual_session
 
                 target = str(account_info.get('account_id') or '')
+                # 这个窗口是本接口开的，验证期间由本流程独占，阻止后台
+                # auto_open / 扫码增强再开一个、或来抢同一个 page。
+                if not captcha_owner.claim(target, '登录窗口验证'):
+                    log_with_user(
+                        'warning',
+                        f"已有验证流程在进行（{captcha_owner.describe(target)}），"
+                        f"本次登录窗口不再另外发起验证",
+                        current_user,
+                    )
+                    return
                 log_with_user(
                     'warning',
                     f"登录窗口里检测到验证码，复用同一窗口等人工完成（不新开浏览器）",
@@ -3324,6 +3336,12 @@ async def browser_login_with_local_browser(
                     from utils.browser_login import clear_pending_verification_window
 
                     clear_pending_verification_window(target or '新账号')
+                except Exception:
+                    pass
+                try:
+                    from utils import captcha_owner
+
+                    captcha_owner.release(target, '登录窗口验证')
                 except Exception:
                     pass
                 try:
