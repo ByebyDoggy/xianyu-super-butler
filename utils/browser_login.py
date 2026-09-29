@@ -25,6 +25,9 @@ DEFAULT_LOGIN_URL = 'https://www.goofish.com/im'
 DEFAULT_TIMEOUT = 300          # 等用户操作的秒数
 POLL_INTERVAL = 2.0            # 轮询 unb 的间隔
 SETTLE_SECONDS = 15            # 拿到 unb 后再等一会，让平台把配套 Cookie 下发完
+# 校验「登录态是否真生效」的最小间隔。这个校验要打一次 mtop，
+# 不能每 2 秒来一发（会把刚登录的账号又推进风控）。
+VERIFY_INTERVAL = 15
 
 
 async def _start_playwright():
@@ -47,6 +50,101 @@ def _find_unb(cookies: list) -> str:
         if cookie.get('name') == 'unb' and cookie.get('value'):
             return str(cookie['value'])
     return ''
+
+
+def _session_usable_from_token_response(payload: dict) -> bool:
+    """Token 接口的响应能不能证明「登录态真的有效」。
+
+    为什么不能只看 cookies 里有没有 unb：浏览器用的是持久化共享 profile，
+    里面可能残留上一次的旧会话（unb / cookie2 都在，但服务端已经不认）。
+    实测后果：点了「本地浏览器登录」，窗口刚开就被判「检测到登录成功」
+    并关掉，浏览器根本没登录，系统却回报「Cookie 已更新」—— 拿回来的是
+    同一份失效 Cookie。
+
+    判定规则：
+      - SUCCESS：拿到 accessToken → 有效
+      - 需要人机验证（FAIL_SYS_USER_VALIDATE / 惩罚 URL）：会话是有效的，
+        只是要过滑块 → 也算有效（不能判成「没登录」，否则用户过完滑块
+        还会被告知登录失败）
+      - SESSION_EXPIRED / 其它：视为无效，继续等用户真正登录
+    """
+    if not isinstance(payload, dict):
+        return False
+
+    ret = payload.get('ret') or []
+    text = ' '.join(str(item) for item in ret)
+    if 'SUCCESS' in text:
+        return True
+    if any(marker in text for marker in ('USER_VALIDATE', 'punish', 'action=captcha', 'RGV587')):
+        return True
+
+    data = payload.get('data')
+    if isinstance(data, dict):
+        url = data.get('url')
+        if isinstance(url, str) and ('punish' in url or 'action=captcha' in url):
+            return True
+    return False
+
+
+async def _verify_session_usable(cookie_id: str, cookies_str: str) -> bool:
+    """拿刚取回的 Cookie 打一次 Token 接口，确认登录态真的能用。"""
+    import json
+    import time
+
+    import aiohttp
+
+    from app.config import API_ENDPOINTS
+    from utils.xianyu_utils import trans_cookies, generate_sign, generate_device_id
+
+    try:
+        cd = trans_cookies(cookies_str)
+        token = (cd.get('_m_h5_tk') or '').split('_')[0]
+        if not token:
+            return False
+
+        ts = str(int(time.time() * 1000))
+        params = {
+            'jsv': '2.7.2', 'appKey': '34839810', 't': ts, 'sign': '', 'v': '1.0',
+            'type': 'originaljson', 'accountSite': 'xianyu', 'dataType': 'json',
+            'timeout': '20000', 'api': 'mtop.taobao.idlemessage.pc.login.token',
+            'sessionOption': 'AutoLoginOnly',
+            'dangerouslySetWindvaneParams': '%5Bobject%20Object%5D',
+            'smToken': 'token', 'queryToken': 'sm', 'sm': 'sm',
+            'spm_cnt': 'a21ybx.im.0.0', 'spm_pre': 'a21ybx.home.sidebar.1.4c053da6vYwnmf',
+            'log_id': '4c053da6vYwnmf',
+        }
+        device_id = generate_device_id(cd.get('unb', ''))
+        data_val = json.dumps(
+            {'appKey': '444e9908a51d1cb236a27862abc769c9', 'deviceId': device_id}
+        )
+        params['sign'] = generate_sign(params['t'], token, data_val)
+
+        headers = {
+            'accept': 'application/json',
+            'content-type': 'application/x-www-form-urlencoded',
+            'user-agent': (
+                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36'
+            ),
+            'referer': 'https://www.goofish.com/',
+            'origin': 'https://www.goofish.com',
+            'cookie': cookies_str,
+        }
+
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                API_ENDPOINTS.get('token'),
+                params=params,
+                data={'data': data_val},
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=20),
+            ) as resp:
+                payload = json.loads(await resp.text())
+        return _session_usable_from_token_response(payload)
+    except Exception as exc:
+        # 网络异常不能当成「登录无效」，否则用户刚登完就被判失败
+        logger.debug(f'【{cookie_id}】校验登录态失败（视为不可用）: {exc}')
+        return False
 
 
 def _config_defaults() -> tuple:
@@ -160,6 +258,8 @@ async def open_login_session(
 
         deadline = time.time() + wait_seconds
         unb = ''
+        session_ok = False
+        last_verify = 0.0
         while time.time() < deadline:
             if window_closed['value']:
                 result['message'] = '浏览器窗口被关闭，登录未完成'
@@ -175,13 +275,32 @@ async def open_login_session(
 
             unb = _find_unb(cookies)
             if unb:
-                logger.info(f'【{label}】检测到登录成功（unb={unb}），等待 Cookie 下发完整')
-                break
+                # 光有 unb 不代表登录成功：这是持久化共享 profile，里面可能残留
+                # 上一次的旧会话（unb / cookie2 都在，但服务端已经不认）。实测后果
+                # 是窗口刚开就被判「登录成功」并关掉，浏览器其实没登录，系统却
+                # 回报「Cookie 已更新」—— 拿回来的是同一份失效 Cookie。
+                # 所以必须拿实际接口验一次。
+                if time.time() - last_verify >= VERIFY_INTERVAL:
+                    last_verify = time.time()
+                    session_ok = await _verify_session_usable(label, _collect_cookies(cookies))
+                    if not session_ok:
+                        logger.warning(
+                            f'【{label}】检测到 unb={unb}，但登录态未生效'
+                            f'（可能是浏览器里的旧会话），继续等待你完成登录…'
+                        )
+                if session_ok:
+                    logger.info(f'【{label}】检测到登录成功（unb={unb}），等待 Cookie 下发完整')
+                    break
 
             await asyncio.sleep(POLL_INTERVAL)
 
-        if not unb:
-            result['message'] = f'等待 {wait_seconds} 秒仍未检测到登录，请重试'
+        if not unb or not session_ok:
+            result['message'] = (
+                f'等待 {wait_seconds} 秒仍未检测到有效登录'
+                f'（浏览器里可能残留旧会话，登录态已失效），请重试'
+                if unb else
+                f'等待 {wait_seconds} 秒仍未检测到登录，请重试'
+            )
             logger.warning(f'【{label}】{result["message"]}')
             return result
 
