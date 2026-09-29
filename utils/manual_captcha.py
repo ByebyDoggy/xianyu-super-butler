@@ -21,19 +21,32 @@ from app.config import browser_headless
 from utils.xianyu_utils import trans_cookies
 
 
-def _has_x5sec(browser_cookies) -> bool:
-    """浏览器 Cookie 里是否已出现 x5sec（滑块通过的权威凭证）。
-
-    只看「滑块元素消失」不够：惩罚页抖动/拖拽失败时元素也会短暂不可见，
-    2026-09-29 就因此拿回一份只带 x5secdata 的 Cookie，接口继续被拒。
-    """
+def _x5sec_values(browser_cookies) -> set:
+    """取浏览器 Cookie 里所有 x5sec 的取值集合。"""
     if not browser_cookies:
-        return False
-    return any(
-        str(item.get('name', '')).lower() == 'x5sec'
+        return set()
+    return {
+        str(item.get('value', ''))
         for item in browser_cookies
         if isinstance(item, dict)
-    )
+        and str(item.get('name', '')).lower() == 'x5sec'
+    }
+
+
+def _has_new_x5sec(browser_cookies, baseline: set) -> bool:
+    """服务端是否**新发**了一个 x5sec（滑块真正通过的凭证）。
+
+    绝不能只判「Cookie 里有没有 x5sec」：账号 Cookie 里往往带着上一次通过时
+    留下的旧 x5sec，我们把它注入浏览器后，第一次轮询就会命中，于是会话开启
+    2 秒就宣告“完成”、窗口当场关闭 —— 用户根本来不及拖滑块（2026-09-29 15:50
+    实测就是这个循环，每 8 秒弹一次）。
+
+    所以只有在 x5sec 的**取值**相对注入前发生变化时才算法成功。
+    """
+    current = _x5sec_values(browser_cookies)
+    if not current:
+        return False
+    return any(value and value not in baseline for value in current)
 
 LOGIN_URL = "https://www.goofish.com/"
 
@@ -232,6 +245,10 @@ async def open_manual_session(
         if cookies_str:
             await context.add_cookies(_to_playwright_cookies(cookies_str))
 
+        # 记下注入前就存在的 x5sec。账号 Cookie 里往往带着上一次通过时的旧
+        # x5sec，注进去后会被误当成“刚过完滑块”（见 _has_new_x5sec 注释）。
+        baseline_x5sec = _x5sec_values(await context.cookies())
+
         page = await context.new_page()
 
         # 惩罚页 URL 优先：只有导航到它才会弹出滑块。
@@ -293,9 +310,9 @@ async def open_manual_session(
         while time.monotonic() < deadline:
             await asyncio.sleep(2)
             try:
-                if _has_x5sec(await context.cookies()):
+                if _has_new_x5sec(await context.cookies(), baseline_x5sec):
                     completed = True
-                    logger.info(f"【{cookie_id}】检测到 x5sec，滑块验证已完成")
+                    logger.info(f"【{cookie_id}】检测到新的 x5sec，滑块验证已完成")
                     break
             except Exception as exc:
                 logger.debug(f"【{cookie_id}】读取浏览器 Cookie 失败: {exc}")
@@ -306,7 +323,7 @@ async def open_manual_session(
                     # 这里给一次短暂宽限：可能刚好拖完、Cookie 还在落盘。
                     for _ in range(3):
                         await asyncio.sleep(1)
-                        if _has_x5sec(await context.cookies()):
+                        if _has_new_x5sec(await context.cookies(), baseline_x5sec):
                             completed = True
                             break
                     if not completed:

@@ -215,6 +215,14 @@ _DETACHED_BROWSER_TASKS = set()
 # 所以用单调时间戳。
 _RECONNECT_REQUESTED_AT: dict = {}
 
+# 每个账号上一次自动弹出滑块浏览器的时间。
+#
+# manual_captcha_in_progress 是实例属性，而账号任务每次重连都会重建实例，
+# 所以它根本拦不住重复弹窗：2026-09-29 15:50 实测每 8 秒弹一次，用户还没
+# 碰到滑块窗口就换了。这里用模块级时间戳做冷却，避免刷屏式弹窗。
+_CAPTCHA_AUTO_OPEN_AT: dict = {}
+CAPTCHA_AUTO_OPEN_COOLDOWN = 20.0
+
 
 def _spawn_detached(coro):
     """启动一个不随实例（账号任务重启）被取消的后台任务。"""
@@ -2985,6 +2993,16 @@ class XianyuLive:
         if self.manual_captcha_in_progress:
             logger.info(f"【{self.cookie_id}】人工验证已在进行，跳过重复开启")
             return
+        # 跨实例冷却：实例会随重连重建，实例级标志拦不住重复弹窗。
+        last_open = _CAPTCHA_AUTO_OPEN_AT.get(self.cookie_id, 0.0)
+        since = time.time() - last_open
+        if since < CAPTCHA_AUTO_OPEN_COOLDOWN:
+            logger.info(
+                f"【{self.cookie_id}】{since:.0f} 秒前刚弹过滑块浏览器，"
+                f"{CAPTCHA_AUTO_OPEN_COOLDOWN - since:.0f} 秒内不重复弹窗"
+            )
+            return
+        _CAPTCHA_AUTO_OPEN_AT[self.cookie_id] = time.time()
         self.manual_captcha_in_progress = True
         try:
             logger.warning(

@@ -15,6 +15,7 @@
 """
 
 import asyncio
+import time
 import unittest
 from unittest.mock import AsyncMock, patch
 
@@ -194,6 +195,10 @@ class AutoOpenSliderBrowserTests(unittest.IsolatedAsyncioTestCase):
         live.background_tasks = set()
         live.send_token_refresh_notification = AsyncMock()
         live._apply_manual_captcha_cookies = AsyncMock(return_value='cookie2=x; x5sec=new')
+        # 清掉跨实例弹窗冷却，否则同一进程内先跑的用例会把后面的挡住
+        import XianyuAutoAsync as mod
+
+        mod._CAPTCHA_AUTO_OPEN_AT.pop(live.cookie_id, None)
         return live
 
     async def test_opens_browser_and_applies_cookie(self):
@@ -215,6 +220,33 @@ class AutoOpenSliderBrowserTests(unittest.IsolatedAsyncioTestCase):
         live._apply_manual_captcha_cookies.assert_not_awaited()
         live.send_token_refresh_notification.assert_awaited_once()
         self.assertFalse(live.manual_captcha_in_progress)
+
+    async def test_repeated_challenge_does_not_spam_windows(self):
+        """回归：连续风控不能每几秒弹一次浏览器。
+
+        2026-09-29 15:50 实测每 8 秒弹一次（实例随重连重建，
+        manual_captcha_in_progress 拦不住），用户还没碰到滑块窗口就换了。
+        """
+        import XianyuAutoAsync as mod
+
+        live = self._live()
+        with patch('utils.manual_captcha.open_manual_session', AsyncMock(
+                return_value={'success': False, 'cookies_str': 'old',
+                              'message': '没完成'})) as om:
+            await live._auto_open_slider_browser(None)
+            self.assertEqual(om.await_count, 1)
+            # 冷却期内再触发：不得再弹窗
+            await live._auto_open_slider_browser(None)
+            self.assertEqual(om.await_count, 1)
+        # 冷却过期后允许再弹
+        mod._CAPTCHA_AUTO_OPEN_AT[live.cookie_id] = (
+            time.time() - mod.CAPTCHA_AUTO_OPEN_COOLDOWN - 1
+        )
+        with patch('utils.manual_captcha.open_manual_session', AsyncMock(
+                return_value={'success': False, 'cookies_str': 'old',
+                              'message': '没完成'})) as om2:
+            await live._auto_open_slider_browser(None)
+            self.assertEqual(om2.await_count, 1)
 
     async def test_no_reentry_while_in_progress(self):
         live = self._live()

@@ -8,23 +8,52 @@ Cookie —— 下一轮接口照样 FAIL_SYS_USER_VALIDATE，表现为「滑块�
 
 import unittest
 
-from utils.manual_captcha import _has_x5sec
+from utils.manual_captcha import _has_new_x5sec, _x5sec_values
 
 
-class HasX5SecTests(unittest.TestCase):
-    def test_requires_real_x5sec(self):
-        self.assertTrue(_has_x5sec([{'name': 'x5sec', 'value': 'v'}]))
-        self.assertTrue(_has_x5sec([{'name': 'X5SEC', 'value': 'v'}]))
+class HasNewX5SecTests(unittest.TestCase):
+    """判据必须是「服务端新发了 x5sec」，不是「Cookie 里有 x5sec」。
 
-    def test_challenge_markers_are_not_success(self):
-        # x5secdata / x5sectag 是「正在被挑战」的标记，恰恰说明还没过
-        self.assertFalse(_has_x5sec([{'name': 'x5secdata', 'value': 'v'}]))
-        self.assertFalse(_has_x5sec([{'name': 'x5sectag', 'value': 'v'}]))
+    2026-09-29 15:50 实测：账号 Cookie 带着上一次通过留下的旧 x5sec，注入
+    浏览器后第一次轮询就命中，会话开启 2 秒即宣告完成、窗口关闭，每 8 秒
+    循环弹一次，用户根本没机会拖滑块。
+    """
 
-    def test_empty_and_junk(self):
-        self.assertFalse(_has_x5sec([]))
-        self.assertFalse(_has_x5sec(None))
-        self.assertFalse(_has_x5sec([{'name': 'unb', 'value': 'v'}]))
+    def test_stale_x5sec_is_not_success(self):
+        injected = [{'name': 'x5sec', 'value': 'old'}]
+        self.assertFalse(_has_new_x5sec(injected, _x5sec_values(injected)))
+
+    def test_newly_issued_x5sec_is_success(self):
+        injected = [{'name': 'x5sec', 'value': 'old'}]
+        base = _x5sec_values(injected)
+        after = injected + [{'name': 'x5sec', 'value': 'brand-new'}]
+        self.assertTrue(_has_new_x5sec(after, base))
+
+    def test_replaced_value_is_success(self):
+        self.assertTrue(
+            _has_new_x5sec([{'name': 'x5sec', 'value': 'new'}], {'old'})
+        )
+
+    def test_case_insensitive_name(self):
+        self.assertTrue(
+            _has_new_x5sec([{'name': 'X5SEC', 'value': 'new'}], {'old'})
+        )
+
+    def test_no_x5sec_at_all(self):
+        self.assertFalse(_has_new_x5sec([{'name': 'unb', 'value': '1'}], {'old'}))
+        self.assertFalse(_has_new_x5sec([], {'old'}))
+        self.assertFalse(_has_new_x5sec(None, {'old'}))
+
+    def test_empty_baseline(self):
+        self.assertTrue(_has_new_x5sec([{'name': 'x5sec', 'value': 'x'}], set()))
+
+    def test_challenge_markers_alone_are_not_success(self):
+        self.assertFalse(
+            _has_new_x5sec(
+                [{'name': 'x5secdata', 'value': 'v'}, {'name': 'x5sectag', 'value': 'v'}],
+                set(),
+            )
+        )
 
 
 class SavedCookieMustContainX5SecTests(unittest.TestCase):
