@@ -207,6 +207,14 @@ COOKIE_REFRESH_PAGE_URL = "https://www.goofish.com/"
 # 恢复」。这里用模块级 set 持有引用，任务不随实例生死。
 _DETACHED_BROWSER_TASKS = set()
 
+# 「立即重连」请求时间戳，按 cookie_id 共享。
+#
+# 必须放在模块级而不是实例属性：实测 2026-09-29 14:20，人工验证完成时账号
+# 任务已经被 manager 重启过（旧实例 14:20:20 退出、新实例接管），信号发给
+# 旧实例等于丢了。另外不能用 asyncio.Event（边沿触发，wait 之前 set 就丢），
+# 所以用单调时间戳。
+_RECONNECT_REQUESTED_AT: dict = {}
+
 
 def _spawn_detached(coro):
     """启动一个不随实例（账号任务重启）被取消的后台任务。"""
@@ -214,6 +222,29 @@ def _spawn_detached(coro):
     _DETACHED_BROWSER_TASKS.add(task)
     task.add_done_callback(_DETACHED_BROWSER_TASKS.discard)
     return task
+
+
+def _consume_reconnect_request(cookie_id: str) -> bool:
+    """取走一个待处理的「立即重连」请求（有则返回 True 并清除）。
+
+    消费式：不比对时间戳，因为请求可能在等待循环布防之前就已登记（2026-09-29
+    14:20 实测：14:20:20 布防等 3600 秒，14:20:25 人工验证完成登记请求，若只认
+    “晚于布防”就又白等 3595 秒）。取走即清，避免旧请求一直触发跳过等待。
+    """
+    if _RECONNECT_REQUESTED_AT.pop(cookie_id, 0.0) > 0:
+        return True
+    return False
+
+
+def request_immediate_reconnect(cookie_id: str) -> None:
+    """登记一次「立刻重连」请求（人工验证完成 / Cookie 换新后调用）。
+
+    写入模块级时间戳，当前正在等待重连的实例（无论新旧）下一次轮询就会看到
+    并提前退出等待。用时间戳而不是 Event，避免边沿触发丢信号；放模块级而不是
+    实例属性，避免账号任务刚被重启、信号发给了已经死掉的旧实例。
+    """
+    _RECONNECT_REQUESTED_AT[cookie_id] = time.time()
+    logger.warning(f"【{cookie_id}】已登记立即重连请求")
 
 class XianyuLive:
     # 类级别的锁字典，为每个order_id维护一个锁（用于自动发货）
@@ -917,7 +948,8 @@ class XianyuLive:
         # 人工过完滑块 / 换好 Cookie 后，要能立刻打断「等待 N 秒后重连」。
         # 实测漏发场景：滑块 13:36:57 就验证完成、风控已解除，但 WS 早被排到
         # 3600 秒后重试，于是用户看到的是「验证过了但账号一直不恢复」。
-        self._reconnect_now = asyncio.Event()
+        # 信号时间戳存模块级（见 _RECONNECT_REQUESTED_AT），跨实例共享。
+        self._reconnect_now = asyncio.Event()  # 保留：仅用于兼容旧调用方
 
         # 会话健康检查的「最长推迟时间」。
         # 上面这个冷却本意是「别在买家正聊着的时候刷 Cookie / 重连」，但它会被
@@ -2931,10 +2963,7 @@ class XianyuLive:
             pass
         if target is not self:
             logger.info(f"【{self.cookie_id}】账号任务已重启，改为通知当前实例立即重连")
-        try:
-            target._reconnect_now.set()
-        except Exception:
-            pass
+        request_immediate_reconnect(self.cookie_id)
         try:
             await target._force_ws_reconnect("人工验证完成")
         except Exception as e:
@@ -11540,16 +11569,18 @@ class XianyuLive:
                                 # 等「立即重连」信号，不直接 sleep：人工过完滑块 / 同步好新
                                 # Cookie 后应马上重连，而不是傻等满 retry_delay（风控场景
                                 # 默认 3600 秒）—— 实测那就是“验证过了但账号不恢复”的原因。
-                                await asyncio.wait_for(
-                                    self._reconnect_now.wait(), timeout=sleep_time
-                                )
-                                logger.warning(
-                                    f"【{self.cookie_id}】收到立即重连信号，"
-                                    f"跳过剩余 {remaining:.1f} 秒等待"
-                                )
-                                self._reconnect_now.clear()
-                                break
-                            except asyncio.TimeoutError:
+                                #
+                                # 用「时间戳」而不是 asyncio.Event：Event 是边沿触发，信号在
+                                # wait() 之前发出就丢了。实测 2026-09-29 14:20：人工验证
+                                # 14:20:25 完成，而等待循环 14:20:20 就已重新布防，set 出来
+                                # 的信号没人接 → 又傻等 3595 秒。时间戳不会丢。
+                                await asyncio.sleep(min(sleep_time, 1.0))
+                                if _consume_reconnect_request(self.cookie_id):
+                                    logger.warning(
+                                        f"【{self.cookie_id}】收到立即重连信号，"
+                                        f"跳过剩余 {remaining:.1f} 秒等待"
+                                    )
+                                    break
                                 remaining -= sleep_time
                                 elapsed = time.time() - start_time
                                 if remaining > 0:
