@@ -8729,6 +8729,16 @@ class XianyuLive:
         logger.info(f"【{self.cookie_id}】Cookie刷新功能已{status}")
 
 
+    def _needs_captcha_now(self) -> bool:
+        """当前账号是否正处于滑块风控中（决定扫码后要不要继续在同一窗口过滑块）。"""
+        try:
+            from utils import risk_control
+
+            guard = risk_control.registry.get(self.cookie_id)
+            return bool(getattr(guard, 'is_blocked', False))
+        except Exception:
+            return False
+
     async def refresh_cookies_from_qr_login(self, qr_cookies_str: str, cookie_id: str = None, user_id: int = None):
         """使用扫码登录获取的cookie访问指定界面获取真实cookie并存入数据库
 
@@ -8744,6 +8754,9 @@ class XianyuLive:
         browser = None
         target_cookie_id = cookie_id or self.cookie_id
         target_user_id = user_id or self.user_id
+        # 为 True 表示浏览器上下文已被人工验证流程接管，finally 里不得关闭它，
+        # 否则又会变成“扫码窗口一闪就关、再弹一个”（用户明确反对）。
+        handed_off_to_manual = False
 
         try:
             import asyncio
@@ -8940,8 +8953,12 @@ class XianyuLive:
             # 等待页面准备
             await asyncio.sleep(0.1)
 
-            # 访问指定页面获取真实cookie
-            target_url = "https://www.goofish.com/im"
+            # 访问页面获取真实 Cookie。
+            #
+            # 绝对不能用 /im：那个页面自带官方 Web IM，会拿着同一份 Cookie 再建
+            # 一条 IM 会话，把机器人的长连接顶成僵尸（详见 COOKIE_REFRESH_PAGE_URL
+            # 的注释）。首页同样能跑 mtop、拿到同样的 session cookie。
+            target_url = COOKIE_REFRESH_PAGE_URL
             logger.info(f"【{target_cookie_id}】访问页面获取真实cookie: {target_url}")
 
             # 使用更灵活的页面访问策略
@@ -9062,6 +9079,42 @@ class XianyuLive:
                 self.last_qr_cookie_refresh_time = time.time()
                 logger.info(f"【{target_cookie_id}】已更新扫码登录Cookie刷新时间标志，_refresh_cookies_via_browser将等待{self.qr_cookie_refresh_cooldown//60}分钟后执行")
 
+                # 扫码登录之后往往紧跟着一个滑块验证。以前这里是直接关掉本窗口，
+                # 再另起一个浏览器弹验证 → 用户看到“一个窗口一闪就关、又弹一个”
+                # （2026-09-29 用户明确反馈）。这里改成：如果此刻正处于风控，
+                # 就**在同一个窗口**里导航到惩罚页等人工过滑块，全程一个浏览器。
+                if self._needs_captcha_now():
+                    handed_off_to_manual = True
+                    try:
+                        from utils.manual_captcha import open_manual_session
+
+                        logger.warning(
+                            f"【{target_cookie_id}】当前账号处于风控，"
+                            f"复用本窗口继续人工过滑块（不新开浏览器）"
+                        )
+                        result = await open_manual_session(
+                            target_cookie_id,
+                            real_cookies_str,
+                            timeout=self.slider_manual_timeout,
+                            reuse_context=context,
+                        )
+                        if result.get('success'):
+                            await self._apply_manual_captcha_cookies(result['cookies_str'])
+                            self.current_token = None
+                            logger.warning(
+                                f"【{target_cookie_id}】同窗口人工验证完成，新 Cookie 已生效"
+                            )
+                        else:
+                            logger.warning(
+                                f"【{target_cookie_id}】同窗口人工验证未完成: "
+                                f"{result.get('message') or '未知原因'}"
+                            )
+                    except Exception as exc:
+                        logger.error(
+                            f"【{target_cookie_id}】同窗口人工验证失败: {self._safe_str(exc)}"
+                        )
+                    # 交给人工验证的窗口由这里负责关闭（复用时本函数不关）
+
                 return True
             else:
                 logger.error(f"【{target_cookie_id}】保存真实Cookie到数据库失败")
@@ -9074,7 +9127,14 @@ class XianyuLive:
             # 确保资源清理
             try:
                 # 先关闭浏览器，再关闭Playwright（顺序很重要）
-                if browser:
+                if handed_off_to_manual and context is not None:
+                    # 窗口已交给人工验证流程，关它会把用户正在拖的滑块弄没，
+                    # 也会让用户看到“窗口一闪就关、又弹一个”。
+                    logger.info(
+                        f"【{target_cookie_id}】浏览器窗口已交给人工验证，"
+                        f"本流程不关闭它"
+                    )
+                elif browser:
                     try:
                         await asyncio.wait_for(browser.close(), timeout=5.0)
                         logger.warning(f"【{target_cookie_id}】浏览器关闭完成")

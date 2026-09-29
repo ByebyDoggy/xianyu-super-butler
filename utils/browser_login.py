@@ -86,6 +86,47 @@ def _session_usable_from_token_response(payload: dict) -> bool:
     return False
 
 
+async def _captcha_pending(context, page) -> bool:
+    """当前窗口里是否出现/即将出现滑块验证。
+
+    登录刚成功时滑块可能还没渲染完，所以既看页面里有没有验证码元素，
+    也看 URL 是否已跳到惩罚页（``punish``/``x5secdata``/``captcha``）。
+    """
+    import asyncio as _asyncio
+
+    selectors = [
+        '#nocaptcha',
+        '#scratch-captcha-btn',
+        '.scratch-captcha-container',
+        '.scratch-captcha-slider',
+        '.nc-container',
+    ]
+
+    # 给验证码一点渲染时间（轮询约 3 秒）
+    for _ in range(6):
+        try:
+            url = (page.url or '').lower()
+            if any(k in url for k in ('punish', 'x5secdata', 'captcha', 'nocaptcha')):
+                logger.info(f'【验证码】登录窗口 URL 已是验证页: {page.url[:110]}')
+                return True
+        except Exception:
+            pass
+        try:
+            for frame in page.frames:
+                for selector in selectors:
+                    try:
+                        element = await frame.query_selector(selector)
+                        if element and await element.is_visible():
+                            logger.info(f'【验证码】登录窗口里检测到滑块元素: {selector}')
+                            return True
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+        await _asyncio.sleep(0.5)
+    return False
+
+
 async def _verify_session_usable(cookie_id: str, cookies_str: str) -> bool:
     """拿刚取回的 Cookie 打一次 Token 接口，确认登录态真的能用。"""
     import json
@@ -164,6 +205,7 @@ async def open_login_session(
     timeout: Optional[int] = None,
     url: Optional[str] = None,
     headless: bool = False,
+    keep_open_if_captcha: bool = False,
 ) -> Dict[str, Any]:
     """打开一个可见的浏览器窗口，等用户在里面完成登录，然后回收 Cookie。
 
@@ -174,6 +216,10 @@ async def open_login_session(
         timeout: 等用户操作的秒数上限。
         url: 登录入口，默认 https://www.goofish.com/im 。
         headless: 是否无头。默认有头 —— 这是给用户自己操作用的窗口。
+        keep_open_if_captcha: 登录成功后发现验证码/风控时，**不关闭窗口**，
+            把 ``context``/``page`` 一并返回给调用方继续人工验证。否则用户会
+            看到“验证码一闪而过、随后又弹一个新浏览器”。返回结果里会带
+            ``keep_open=True``，此时调用方负责关闭窗口。
 
     Returns:
         ``{"success": bool, "message": str, "cookies_str": str, "unb": str}``
@@ -328,6 +374,22 @@ async def open_login_session(
             'unb': unb,
             'message': f'登录成功（unb={unb}，Cookie {len(names)} 个字段）',
         })
+
+        # 登录成功的瞬间往往紧接着弹一个滑块验证。以前这里直接 return，
+        # finally 无条件 context.close() —— 用户看到的正是“验证码只出现不到
+        # 2 秒窗口就被关了”（2026-09-29 用户反馈）。
+        # 这里改为：若检测到验证码/风控，就**保留本窗口**交给人工验证，
+        # 不再新开浏览器，满足“全部流程在同一个有头浏览器内”。
+        if keep_open_if_captcha and await _captcha_pending(context, page):
+            result['keep_open'] = True
+            result['context'] = context
+            result['page'] = page
+            logger.warning(
+                f'【{label}】检测到验证码/风控，保留本窗口交给人工验证'
+                f'（不关闭、不新开浏览器）'
+            )
+            return result
+
         logger.info(
             f'【{label}】登录成功: unb={unb}, 字段数={len(names)}, '
             f'含 x5sec={"x5sec" in names}'
@@ -339,16 +401,25 @@ async def open_login_session(
         logger.error(f'【{label}】{result["message"]}')
         return result
     finally:
-        if context is not None:
-            try:
-                await context.close()
-                logger.info(f'【{label}】登录用浏览器已关闭（profile 已保留）')
-            except Exception as close_error:
-                logger.warning(f'【{label}】关闭登录浏览器失败: {close_error}')
-        if playwright is not None:
-            try:
-                await playwright.stop()
-            except Exception:
-                pass
-        if profile_held:
-            await release_profile_async(cookie_id or None, '本地浏览器登录')
+        # 窗口已被要求保留（交给人工验证）时不得关闭 —— 关掉的话用户又只能看到
+        # “验证码一闪而过”，而且接下来还要再弹一个新的浏览器。
+        # Playwright 与 profile 占用同样不能释放：窗口还活着就需要它们。
+        # 注意：这里绝不能写 return（finally 里 return 会吞掉异常）。
+        if not result.get('keep_open'):
+            if context is not None:
+                try:
+                    await context.close()
+                    logger.info(f'【{label}】登录用浏览器已关闭（profile 已保留）')
+                except Exception as close_error:
+                    logger.warning(f'【{label}】关闭登录浏览器失败: {close_error}')
+            if playwright is not None:
+                try:
+                    await playwright.stop()
+                except Exception:
+                    pass
+            if profile_held:
+                await release_profile_async(cookie_id or None, '本地浏览器登录')
+        else:
+            logger.info(
+                f'【{label}】登录窗口已保留给人工验证（保留 Playwright 与 profile 占用）'
+            )

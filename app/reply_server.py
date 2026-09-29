@@ -3209,6 +3209,10 @@ async def browser_login_with_local_browser(
         cookie_id=cookie_id or None,
         timeout=timeout,
         url=str(request.get('url') or '').strip() or None,
+        # 登录成功瞬间往往紧跟一个滑块。开启这个开关后如果探到验证码，
+        # 登录窗口会保持打开并回传 context/page，我们在同一个窗口里继续
+        # 等人工过滑块 —— 不再“一闪就关、又弹一个新浏览器”。
+        keep_open_if_captcha=True,
     )
 
     if not info.get('success'):
@@ -3258,6 +3262,78 @@ async def browser_login_with_local_browser(
             )
 
     asyncio.create_task(_background_enhance())
+
+    # 如果登录窗口因为探到验证码而被保留，就在**同一个窗口**里继续等人工
+    # 过完滑块，然后关掉它。全程一个有头浏览器（用户明确要求）。
+    if info.get('keep_open'):
+        kept_context = info.get('context')
+        kept_page = info.get('page')
+
+        async def _manual_then_close():
+            try:
+                from utils.manual_captcha import open_manual_session
+
+                target = str(account_info.get('account_id') or '')
+                log_with_user(
+                    'warning',
+                    f"登录窗口里检测到验证码，复用同一窗口等人工完成（不新开浏览器）",
+                    current_user,
+                )
+                result = await open_manual_session(
+                    target,
+                    info['cookies_str'],
+                    timeout=600,
+                    reuse_context=kept_context,
+                )
+                if result.get('success'):
+                    try:
+                        from XianyuAutoAsync import XianyuLive
+
+                        live = XianyuLive._instances.get(target)
+                        if live is not None:
+                            await live._apply_manual_captcha_cookies(
+                                result['cookies_str']
+                            )
+                            live.current_token = None
+                        else:
+                            log_with_user(
+                                'info',
+                                "账号实例未运行，新 Cookie 已落库，启动时会自动加载",
+                                current_user,
+                            )
+                    except Exception as exc:
+                        log_with_user(
+                            'warning', f"同步人工验证结果失败: {exc}", current_user
+                        )
+                    log_with_user(
+                        'info', "同窗口人工验证完成，新 Cookie 已生效", current_user
+                    )
+                else:
+                    log_with_user(
+                        'warning',
+                        f"同窗口人工验证未完成: {result.get('message') or '未知原因'}",
+                        current_user,
+                    )
+            except Exception as exc:
+                log_with_user(
+                    'error', f"同窗口人工验证异常: {exc}", current_user
+                )
+            finally:
+                # 验证结束（无论成败）才关闭这个窗口
+                try:
+                    if kept_context is not None:
+                        await kept_context.close()
+                    if kept_page is not None:
+                        try:
+                            await kept_page.close()
+                        except Exception:
+                            pass
+                except Exception as exc:
+                    log_with_user(
+                        'warning', f"关闭登录窗口失败: {exc}", current_user
+                    )
+
+        asyncio.create_task(_manual_then_close())
 
     return {
         'success': True,

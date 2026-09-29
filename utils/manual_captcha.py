@@ -179,6 +179,7 @@ async def open_manual_session(
     timeout: int = DEFAULT_TIMEOUT,
     headless: Optional[bool] = None,
     verification_url: Optional[str] = None,
+    reuse_context=None,
 ) -> Dict[str, Any]:
     """打开一个人工验证会话，等待人在浏览器里完成滑块。
 
@@ -190,6 +191,11 @@ async def open_manual_session(
             无显示器的服务器可设 BROWSER_HEADLESS=true 退回无头。
         verification_url: 滑块惩罚页 URL（可选）。调用方刚刚在 Token 刷新
             响应里拿到的话直接传进来，可以省一次额外请求。
+        reuse_context: 复用调用方已经打开的浏览器上下文（同一个可见窗口）。
+            扫码登录后紧接着就要过滑块时传进来，用户看到的就是**一个**窗口
+            从头做到尾，而不是“一个一闪就关、再弹一个新的”（2026-09-29 用户
+            明确要求全部流程在同一个有头浏览器内）。复用时调用方负责该
+            上下文的关闭，本函数不得关它。
 
     Returns:
         ``{"success": bool, "cookies_str": str, "message": str, "session_id": str}``。
@@ -212,35 +218,40 @@ async def open_manual_session(
 
     playwright = None
     browser = None
-    context = None
+    context = reuse_context
     refresh_task = None
     profile_held = False
+    owns_context = reuse_context is None
     try:
-        # 同一账号的 profile 是独占的（登录 / 滑块 / 取订单共用一份），
-        # 先拿到占用再启动，抢不到就明确报错。
-        from utils.browser_profile import acquire_profile_async
+        if owns_context:
+            # 同一账号的 profile 是独占的（登录 / 滑块 / 取订单共用一份），
+            # 先拿到占用再启动，抢不到就明确报错。
+            from utils.browser_profile import acquire_profile_async
 
-        await acquire_profile_async(cookie_id, '人工验证码')
-        profile_held = True
+            await acquire_profile_async(cookie_id, '人工验证码')
+            profile_held = True
 
-        playwright = await async_playwright().start()
+            playwright = await async_playwright().start()
 
-        # 与登录 / 滑块共用同一个持久化 profile：平台会把“登录”和“过验证”看成
-        # 同一台设备（指纹、访问历史、localStorage 全部连续），通过率明显高于
-        # 每次全新的一次性上下文。
-        from utils.browser_profile import (
-            clean_singleton_lock_files,
-            launch_shared_context,
-            profile_dir,
-        )
+            # 与登录 / 滑块共用同一个持久化 profile：平台会把“登录”和“过验证”看成
+            # 同一台设备（指纹、访问历史、localStorage 全部连续），通过率明显高于
+            # 每次全新的一次性上下文。
+            from utils.browser_profile import (
+                clean_singleton_lock_files,
+                launch_shared_context,
+                profile_dir,
+            )
 
-        profile_path = profile_dir(cookie_id)
-        clean_singleton_lock_files(profile_path, label=cookie_id)
+            profile_path = profile_dir(cookie_id)
+            clean_singleton_lock_files(profile_path, label=cookie_id)
 
-        browser = None  # 持久化模式下没有独立 browser 句柄
-        context = await launch_shared_context(
-            playwright, profile_path, headless=headless, purpose='人工验证码'
-        )
+            browser = None  # 持久化模式下没有独立 browser 句柄
+            context = await launch_shared_context(
+                playwright, profile_path, headless=headless, purpose='人工验证码'
+            )
+        else:
+            # 复用调用方窗口：profile 已由调用方持有，不要再抢锁。
+            logger.info(f"【{cookie_id}】复用已打开的有头浏览器窗口进行人工验证")
 
         if cookies_str:
             await context.add_cookies(_to_playwright_cookies(cookies_str))
@@ -372,7 +383,7 @@ async def open_manual_session(
             await captcha_controller.close_session(session_id)
         except Exception:
             pass
-        for closer in (context, browser):
+        for closer in ((context, browser) if owns_context else ()):
             if closer is not None:
                 try:
                     await closer.close()
@@ -387,6 +398,10 @@ async def open_manual_session(
             from utils.browser_profile import release_profile_async
 
             await release_profile_async(cookie_id, '人工验证码')
+        if not owns_context:
+            logger.info(
+                f"【{cookie_id}】人工验证结束，保留复用的浏览器窗口（由调用方关闭）"
+            )
 
 
 async def _wait_for_captcha_present(page, timeout: int = CAPTCHA_PRESENT_TIMEOUT) -> bool:
