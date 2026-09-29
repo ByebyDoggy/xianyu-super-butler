@@ -149,6 +149,7 @@ async def open_manual_session(
     cookies_str: str,
     timeout: int = DEFAULT_TIMEOUT,
     headless: Optional[bool] = None,
+    verification_url: Optional[str] = None,
 ) -> Dict[str, Any]:
     """打开一个人工验证会话，等待人在浏览器里完成滑块。
 
@@ -158,6 +159,8 @@ async def open_manual_session(
             无头虽然可以靠远程通道把页面推给用户，但无头 Chrome 的指纹
             很容易被 nc 识破，人工验证本来就要求“像真人”，所以默认有头；
             无显示器的服务器可设 BROWSER_HEADLESS=true 退回无头。
+        verification_url: 滑块惩罚页 URL（可选）。调用方刚刚在 Token 刷新
+            响应里拿到的话直接传进来，可以省一次额外请求。
 
     Returns:
         ``{"success": bool, "cookies_str": str, "message": str, "session_id": str}``。
@@ -219,9 +222,10 @@ async def open_manual_session(
         # 原实现导航到闲鱼首页，首页没有滑块 → check_completion 立刻误判
         # “已完成” → 浏览器秒关，用户连上控制页时会话已不存在。
         #
-        # 先触发一次实时 Token 刷新拿最新 URL（账号正在风控才返回）；拿不到
-        # 再退回 DB 里最近一次惩罚 URL（可能已过期，等滑块时会发现）。
-        verification_url = await _fetch_live_verification_url(cookie_id, cookies_str)
+        # 调用方刚在 Token 刷新响应里拿到的话直接用（省一次请求）；拿不到
+        # 再主动触发一次刷新拿新鲜 URL；仍拿不到才退回 DB 里最近一次惩罚 URL
+        # （可能已过期，等滑块时会发现）。
+        verification_url = verification_url or await _fetch_live_verification_url(cookie_id, cookies_str)
         if not verification_url:
             verification_url = get_verification_url(cookie_id)
         if not verification_url:

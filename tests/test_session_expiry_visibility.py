@@ -178,5 +178,83 @@ class AutoConfirmSessionExpiredTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(main.needs_relogin)
 
 
+class AutoOpenSliderBrowserTests(unittest.IsolatedAsyncioTestCase):
+    """检测到滑块时自动弹出本项目浏览器，完成后 Cookie 自动回填。"""
+
+    def _live(self):
+        live = XianyuLive.__new__(XianyuLive)
+        live.cookie_id = '2222222222'
+        live.needs_relogin = False
+        live.relogin_reason = ''
+        live.cookies_str = 'cookie2=x; _m_h5_tk=tok_1'
+        live.current_token = 'old-token'
+        live.manual_captcha_in_progress = False
+        live.slider_manual_timeout = 600
+        live.auto_open_slider_browser = True
+        live.background_tasks = set()
+        live.send_token_refresh_notification = AsyncMock()
+        live._apply_manual_captcha_cookies = AsyncMock(return_value='cookie2=x; x5sec=new')
+        return live
+
+    async def test_opens_browser_and_applies_cookie(self):
+        live = self._live()
+        with patch('utils.manual_captcha.open_manual_session', AsyncMock(
+                return_value={'success': True, 'cookies_str': 'cookie2=x; x5sec=new',
+                              'message': '', 'session_id': '2222222222'})):
+            await live._auto_open_slider_browser('https://punish-url')
+        live._apply_manual_captcha_cookies.assert_awaited_once_with('cookie2=x; x5sec=new')
+        self.assertIsNone(live.current_token)     # 令牌已清，让 WS 用新 Cookie 重连
+        self.assertFalse(live.manual_captcha_in_progress)
+
+    async def test_timeout_notifies_and_does_not_apply(self):
+        live = self._live()
+        with patch('utils.manual_captcha.open_manual_session', AsyncMock(
+                return_value={'success': False, 'cookies_str': 'old',
+                              'message': '人工验证未完成'})):
+            await live._auto_open_slider_browser(None)
+        live._apply_manual_captcha_cookies.assert_not_awaited()
+        live.send_token_refresh_notification.assert_awaited_once()
+        self.assertFalse(live.manual_captcha_in_progress)
+
+    async def test_no_reentry_while_in_progress(self):
+        live = self._live()
+        live.manual_captcha_in_progress = True
+        with patch('utils.manual_captcha.open_manual_session', AsyncMock()) as om:
+            await live._auto_open_slider_browser(None)
+        om.assert_not_awaited()
+
+
+class HandleCaptchaAutoOpenWiringTests(unittest.IsolatedAsyncioTestCase):
+    """检测到滑块时必须真的把自动弹窗任务跑起来（之前只发通知就 return）。"""
+
+    def _live(self):
+        live = XianyuLive.__new__(XianyuLive)
+        live.cookie_id = '2222222222'
+        live.auto_solve_slider = False
+        live.notify_on_verification = True
+        live.auto_open_slider_browser = True
+        live.background_tasks = set()
+        live.send_token_refresh_notification = AsyncMock()
+        live._auto_open_slider_browser = AsyncMock()
+        return live
+
+    async def test_slider_event_spawns_auto_open(self):
+        live = self._live()
+        url = 'https://h5api.m.goofish.com/punish?x5secdata=abc'
+        await live._handle_captcha_verification({'data': {'url': url}})
+        # 自动弹窗是后台任务（asyncio.create_task 只调度不执行），
+        # 让事件循环把挂起的任务跑完再断言
+        pending = [t for t in live.background_tasks if not t.done()]
+        if pending:
+            await asyncio.gather(*pending)
+        live._auto_open_slider_browser.assert_awaited_once_with(url)
+
+    async def test_disabled_when_auto_open_off(self):
+        live = self._live()
+        live.auto_open_slider_browser = False
+        await live._handle_captcha_verification({'data': {'url': 'https://x'}})
+        live._auto_open_slider_browser.assert_not_awaited()
+
+
 if __name__ == '__main__':
     unittest.main()

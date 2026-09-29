@@ -816,6 +816,17 @@ class XianyuLive:
         self.notify_on_verification = bool(
             SLIDER_VERIFICATION.get('notify_on_verification', True)
         )
+        # 检测到滑块时，自动弹出「本项目的有头浏览器」等人工完成验证。
+        # 必须用本项目浏览器：滑块拦的是设备/行为指纹，买家自己电脑上过滑块
+        # 用的是另一份会话，过了也救不回这个账号。自动过滑块已停用时，
+        # 这是唯一不需要人肉拼 Cookie 的恢复路径。
+        self.notify_on_verification = bool(
+            SLIDER_VERIFICATION.get('notify_on_verification', True)
+        )
+        self.auto_open_slider_browser = bool(
+            SLIDER_VERIFICATION.get('auto_open_browser', True)
+        )
+        self.slider_manual_timeout = 600  # 等人工过滑块的秒数（10 分钟）
         self.notification_lock = asyncio.Lock()  # 通知防重复机制的异步锁
 
         # 自动发货防重复机制
@@ -2840,6 +2851,97 @@ class XianyuLive:
             logger.error(f"【{self.cookie_id}】检查是否需要滑块验证时出错: {self._safe_str(e)}")
             return False
 
+    async def _apply_manual_captcha_cookies(self, cookies_str: str) -> str:
+        """把人工验证拿到的新 Cookie 落库并同步到运行实例，解除风控。
+
+        人工验证拿到 x5sec 后必须清掉 x5secdata 等挑战标记，否则闲鱼会认为
+        验证仍未完成，继续返回 FAIL_SYS_USER_VALIDATE —— 表现为
+        「滑块过了但账号还是用不了」。
+
+        Returns:
+            清理过挑战标记后的新 Cookie 字符串。
+        """
+        from utils.xianyu_utils import drop_stale_captcha_challenge
+
+        cleaned = drop_stale_captcha_challenge(cookies_str)
+        if cleaned != cookies_str:
+            logger.info(f"【{self.cookie_id}】已清除过期的验证挑战标记")
+        db_manager.save_cookie(self.cookie_id, cleaned)
+
+        # 运行中的实例仍持有旧 Cookie，不同步会继续用旧值打接口并立刻再次熔断
+        try:
+            from app.cookie_manager import manager as cookie_manager
+            manager = getattr(cookie_manager, 'manager', None)
+            if manager is not None:
+                manager.cookies[self.cookie_id] = cleaned
+                instance = manager.instances.get(self.cookie_id)
+                if instance is not None:
+                    instance.cookies_str = cleaned
+                    # 清掉失效令牌，强制下次请求重新获取
+                    instance.current_token = None
+                    logger.info(f"【{self.cookie_id}】运行实例已同步新 Cookie")
+        except Exception as e:
+            logger.warning(f"【{self.cookie_id}】同步运行实例 Cookie 失败: {self._safe_str(e)}")
+
+        try:
+            from utils import risk_control
+            risk_control.registry.get(self.cookie_id).reset()
+            logger.info(f"【{self.cookie_id}】风控状态已解除")
+        except Exception as e:
+            logger.warning(f"【{self.cookie_id}】重置风控状态失败: {self._safe_str(e)}")
+        return cleaned
+
+    async def _auto_open_slider_browser(self, verification_url: str = None):
+        """自动弹出「本项目自己的有头浏览器」等人工完成滑块验证。
+
+        为什么必须用本项目浏览器：滑块拦的是设备/行为指纹，用买家自己电脑
+        上的浏览器过滑块是另一份会话，过了也救不回这个账号 —— 实测无效。
+        而自动过滑块（auto_solve）已停用（服务端查行为特征，自动拖必失败），
+        所以「弹出本项目浏览器 + 人来拖」是唯一不需要人肉拼 Cookie 的恢复路径。
+
+        完成后把新 Cookie 落库并同步到运行实例，风控清零，账号立刻恢复。
+        """
+        from utils.manual_captcha import open_manual_session
+
+        if self.manual_captcha_in_progress:
+            logger.info(f"【{self.cookie_id}】人工验证已在进行，跳过重复开启")
+            return
+        self.manual_captcha_in_progress = True
+        try:
+            logger.warning(
+                f"【{self.cookie_id}】检测到滑块验证，自动弹出本项目有头浏览器，"
+                f"请在弹出的窗口里完成验证（最长等 {self.slider_manual_timeout} 秒）"
+            )
+            result = await open_manual_session(
+                self.cookie_id,
+                self.cookies_str,
+                timeout=self.slider_manual_timeout,
+                verification_url=verification_url,
+            )
+            if result.get('success'):
+                await self._apply_manual_captcha_cookies(result['cookies_str'])
+                # 清掉失效令牌，让 WS 尽快用新 Cookie 重连
+                self.current_token = None
+                logger.warning(
+                    f"【{self.cookie_id}】人工验证完成，新 Cookie 已生效，账号即将自动恢复"
+                )
+            else:
+                logger.warning(
+                    f"【{self.cookie_id}】人工验证未完成: {result.get('message') or '未知原因'}"
+                )
+                await self.send_token_refresh_notification(
+                    f"人工滑块验证未完成：{result.get('message') or '未知原因'}\n"
+                    f"请到「账号管理」里重新触发验证，或重新扫码登录。",
+                    "captcha_manual_required",
+                    verification_url=verification_url,
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.error(f"【{self.cookie_id}】自动弹出滑块浏览器失败: {self._safe_str(e)}")
+        finally:
+            self.manual_captcha_in_progress = False
+
     async def _handle_captcha_verification(self, res_json: dict) -> str:
         """处理滑块验证，返回新的cookies字符串"""
         try:
@@ -2875,16 +2977,30 @@ class XianyuLive:
                 )
 
                 if self.notify_on_verification:
-                    await self.send_token_refresh_notification(
-                        "账号被闲鱼要求完成人机验证（滑块），当前已停用自动过滑块，"
-                        "需要你手动处理。步骤：① 打开下面的验证链接，用真实鼠标拖动滑块；"
-                        "② 通过后回到系统「账号管理」→「粘贴 Cookie 添加」，"
-                        "把浏览器的 Cookie 整段粘回（要含 x5sec）。",
-                        "captcha_manual_required",
-                        verification_url=verification_url,
+                    if self.auto_open_slider_browser:
+                        await self.send_token_refresh_notification(
+                            "账号被闲鱼要求完成人机验证（滑块）。\n"
+                            "已自动弹出本项目自己的浏览器窗口，请在窗口里完成滑块验证，"
+                            "完成后账号会自动恢复。",
+                            "captcha_manual_required",
+                            verification_url=verification_url,
+                        )
+                    else:
+                        await self.send_token_refresh_notification(
+                            "账号被闲鱼要求完成人机验证（滑块），当前已停用自动过滑块，"
+                            "需要你手动处理。步骤：① 打开下面的验证链接，用真实鼠标拖动滑块；"
+                            "② 通过后回到系统「账号管理」→「粘贴 Cookie 添加」，"
+                            "把浏览器的 Cookie 整段粘回（要含 x5sec）。",
+                            "captcha_manual_required",
+                            verification_url=verification_url,
+                        )
+
+                # 自动弹出本项目浏览器等人工验证。原来只发通知就 return，
+                # 结果用户在自己电脑上过滑块（另一份会话）无效，账号一直卡死。
+                if self.auto_open_slider_browser:
+                    self._create_tracked_task(
+                        self._auto_open_slider_browser(verification_url)
                     )
-                else:
-                    logger.info(f"【{self.cookie_id}】notify_on_verification 已关闭，跳过验证通知")
 
                 return None
 
