@@ -18,6 +18,22 @@ from typing import Any, Dict, Optional
 
 from loguru import logger
 from app.config import browser_headless
+from utils.xianyu_utils import trans_cookies
+
+
+def _has_x5sec(browser_cookies) -> bool:
+    """浏览器 Cookie 里是否已出现 x5sec（滑块通过的权威凭证）。
+
+    只看「滑块元素消失」不够：惩罚页抖动/拖拽失败时元素也会短暂不可见，
+    2026-09-29 就因此拿回一份只带 x5secdata 的 Cookie，接口继续被拒。
+    """
+    if not browser_cookies:
+        return False
+    return any(
+        str(item.get('name', '')).lower() == 'x5sec'
+        for item in browser_cookies
+        if isinstance(item, dict)
+    )
 
 LOGIN_URL = "https://www.goofish.com/"
 
@@ -265,19 +281,46 @@ async def open_manual_session(
         # 关键：会话期间浏览器必须保持存活，等用户拖完才返回。
         # 原实现在这里死等 timeout，且 check_completion 在无滑块时误判完成
         # 直接秒关 —— 改为“滑块出现后，持续等待它消失（完成）或超时”。
+        #
+        # 但只看「滑块元素消失」仍然会误判：惩罚页在拖拽失败/加载中途也会
+        # 让 #nocaptcha 短暂不可见，于是 2026-09-29 事故里报「人工验证完成」
+        # 并拿回一份只带 x5secdata、没有 x5sec 的 Cookie —— 下一轮接口照样
+        # FAIL_SYS_USER_VALIDATE，账号一直不恢复。
+        #
+        # 穿过滑块的唯一权威凭证是 Cookie 里出现 x5sec，所以以它为准。
         deadline = time.monotonic() + timeout
         completed = False
         while time.monotonic() < deadline:
             await asyncio.sleep(2)
             try:
-                if await captcha_controller.check_completion(session_id):
+                if _has_x5sec(await context.cookies()):
                     completed = True
+                    logger.info(f"【{cookie_id}】检测到 x5sec，滑块验证已完成")
                     break
+            except Exception as exc:
+                logger.debug(f"【{cookie_id}】读取浏览器 Cookie 失败: {exc}")
+                continue
+            try:
+                if await captcha_controller.check_completion(session_id):
+                    # 元素消失 ≠ 验证通过（可能只是页面抖动），必须以 x5sec 为准。
+                    # 这里给一次短暂宽限：可能刚好拖完、Cookie 还在落盘。
+                    for _ in range(3):
+                        await asyncio.sleep(1)
+                        if _has_x5sec(await context.cookies()):
+                            completed = True
+                            break
+                    if not completed:
+                        logger.warning(
+                            f"【{cookie_id}】滑块元素已消失，但 Cookie 里仍未出现 x5sec，"
+                            f"继续等待人工完成（不要关窗口）"
+                        )
+                    if completed:
+                        break
             except Exception as exc:
                 logger.debug(f"【{cookie_id}】检查验证完成状态失败: {exc}")
 
         if not completed:
-            result["message"] = f"人工验证超时（{timeout} 秒内未完成）"
+            result["message"] = f"人工验证超时（{timeout} 秒内未通过，或未取得 x5sec）"
             logger.warning(f"【{cookie_id}】{result['message']}")
             return result
 
@@ -285,6 +328,14 @@ async def open_manual_session(
         if not new_cookies:
             result["message"] = "验证已完成但未取到 Cookie"
             return result
+        # 双保险：成功路径上必须真的带 x5sec，不能拿挑战中的 Cookie 去覆盖
+        try:
+            if "x5sec" not in {k.lower() for k in trans_cookies(new_cookies)}:
+                result["message"] = "验证已完成但新 Cookie 缺少 x5sec，已放弃覆盖"
+                logger.warning(f"【{cookie_id}】{result['message']}")
+                return result
+        except Exception:
+            pass
 
         result["success"] = True
         result["cookies_str"] = new_cookies
