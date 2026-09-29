@@ -9392,6 +9392,18 @@ async def start_manual_captcha(
             risk_control.registry.get(cookie_id).reset()
         except Exception as exc:
             log_with_user('warning', f"重置风控状态失败: {exc}", current_user)
+
+        # 验证过了就该马上恢复：若 main 正卡在「等待 N 秒后重连」（风控场景默认
+        # 3600 秒），必须把它打断，否则用户会看到「验证完成了但账号一直不恢复」。
+        try:
+            manager = cookie_manager.manager
+            instance = manager.instances.get(cookie_id) if manager is not None else None
+            reconnect_now = getattr(instance, '_reconnect_now', None)
+            if reconnect_now is not None:
+                reconnect_now.set()
+                log_with_user('info', f"账号 {cookie_id} 已触发立即重连", current_user)
+        except Exception as exc:
+            log_with_user('warning', f"触发立即重连失败: {exc}", current_user)
         log_with_user('info', f"账号 {cookie_id} 人工验证完成，已更新 Cookie", current_user)
 
     return JSONResponse({

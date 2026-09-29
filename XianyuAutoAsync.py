@@ -896,6 +896,11 @@ class XianyuLive:
         self.last_message_received_time = 0  # 记录上次收到消息的时间
         self.message_cookie_refresh_cooldown = 300  # 收到消息后5分钟内不执行Cookie刷新
 
+        # 人工过完滑块 / 换好 Cookie 后，要能立刻打断「等待 N 秒后重连」。
+        # 实测漏发场景：滑块 13:36:57 就验证完成、风控已解除，但 WS 早被排到
+        # 3600 秒后重试，于是用户看到的是「验证过了但账号一直不恢复」。
+        self._reconnect_now = asyncio.Event()
+
         # 会话健康检查的「最长推迟时间」。
         # 上面这个冷却本意是「别在买家正聊着的时候刷 Cookie / 重连」，但它会被
         # 无限期推迟：店里只要有消息就永远处在冷却里，于是「登录态已过期」这种
@@ -2889,6 +2894,14 @@ class XianyuLive:
             logger.info(f"【{self.cookie_id}】风控状态已解除")
         except Exception as e:
             logger.warning(f"【{self.cookie_id}】重置风控状态失败: {self._safe_str(e)}")
+
+        # 验证过了就该马上恢复：① 若正在等「N 秒后重连」则打断它；
+        # ② 若连接还活着则主动断开，让 main 用新 Cookie 重新 /reg。
+        try:
+            self._reconnect_now.set()
+        except Exception:
+            pass
+        await self._force_ws_reconnect("人工验证完成")
         return cleaned
 
     async def _auto_open_slider_browser(self, verification_url: str = None):
@@ -3423,7 +3436,11 @@ class XianyuLive:
             
             username = account_info.get('username', '')
             password = account_info.get('password', '')
-            show_browser = account_info.get('show_browser', False)
+            # 密码登录刷新可能遇到滑块/人脸，必须用有头窗口：无头 Chrome 会被
+            # 阿里 nc 直接识破，出问题用户也无法接管浏览器。
+            # 这里不再用账号级的 show_browser（默认 False = 无头）决定，
+            # 统一跟随 BROWSER.headless（默认有头，见 global_config.yml）。
+            show_browser = not browser_headless()
             
             # 检查是否配置了用户名和密码
             if not username or not password:
@@ -3941,7 +3958,11 @@ class XianyuLive:
     def _get_playwright_launch_options(self, playwright, browser_args, purpose: str) -> dict:
         """构造浏览器启动参数，Playwright浏览器缺失时回退到系统Chrome/Edge。"""
         launch_options = {
-            'headless': True,
+            # 不要硬编码 headless=True：这个服务跑在可交互的 Windows 桌面上，
+            # 无头 Chrome 的指纹会被阿里 nc 直接识破（实测无头 0/2 通过），
+            # 而且出问题时用户没法直接接管浏览器过风控。统一跟随 BROWSER.headless
+            # （默认 false = 有头，见 global_config.yml）。
+            'headless': browser_headless(),
             'args': browser_args,
             # 显式指定完整版 Chromium。headless=True 时 Playwright 会优先找
             # chromium_headless_shell-*，那是与 chromium-* 分开下载的另一份文件；
@@ -6326,8 +6347,9 @@ class XianyuLive:
                     )
 
                 if not result:
-                    # 确定是否使用有头模式（调试用）
-                    headless_mode = True if debug_headless is None else debug_headless
+                    # 是否使用有头模式（调试用）。默认跟随 BROWSER.headless：
+                    # 本服务跑在可交互桌面上，有头更不容易被风控，也方便人工接管。
+                    headless_mode = browser_headless() if debug_headless is None else debug_headless
                     if not headless_mode:
                         logger.info(f"【{self.cookie_id}】🖥️ 启用有头模式进行调试")
 
@@ -8759,7 +8781,9 @@ class XianyuLive:
                 ("Edge", r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"),
             ]
             launch_options = {
-                'headless': True,
+                # 扫码后的取 Cookie 浏览器同样要有头：见 _get_playwright_launch_options
+                # 的注释（无头指纹会被识破，出问题也没法人工接管）。
+                'headless': browser_headless(),
                 'args': browser_args,
             }
 
@@ -8791,9 +8815,9 @@ class XianyuLive:
                     f"回退使用系统{browser_name}: {browser_path}"
                 )
 
-            logger.info(f"【{target_cookie_id}】正在启动无头浏览器")
+            logger.info(f"【{target_cookie_id}】正在启动扫码登录用浏览器")
             browser = await browser_limit.launch_browser(playwright, launch_options, "扫码登录")
-            logger.info(f"【{target_cookie_id}】无头浏览器启动成功")
+            logger.info(f"【{target_cookie_id}】浏览器启动成功")
 
             # 创建浏览器上下文
             context_options = {
@@ -11473,7 +11497,19 @@ class XianyuLive:
                         while remaining > 0:
                             sleep_time = min(chunk_size, remaining)
                             try:
-                                await asyncio.sleep(sleep_time)
+                                # 等「立即重连」信号，不直接 sleep：人工过完滑块 / 同步好新
+                                # Cookie 后应马上重连，而不是傻等满 retry_delay（风控场景
+                                # 默认 3600 秒）—— 实测那就是“验证过了但账号不恢复”的原因。
+                                await asyncio.wait_for(
+                                    self._reconnect_now.wait(), timeout=sleep_time
+                                )
+                                logger.warning(
+                                    f"【{self.cookie_id}】收到立即重连信号，"
+                                    f"跳过剩余 {remaining:.1f} 秒等待"
+                                )
+                                self._reconnect_now.clear()
+                                break
+                            except asyncio.TimeoutError:
                                 remaining -= sleep_time
                                 elapsed = time.time() - start_time
                                 if remaining > 0:
@@ -11489,7 +11525,8 @@ class XianyuLive:
                             except Exception as sleep_error:
                                 logger.error(f"【{self.cookie_id}】等待期间发生异常: {self._safe_str(sleep_error)}")
                                 logger.warning(f"【{self.cookie_id}】等待异常堆栈:\n{traceback.format_exc()}")
-                                # 即使出错也继续等待剩余时间
+                                # 即使出错也要递减，避免死循环
+                                remaining -= sleep_time
                                 if remaining > 0:
                                     await asyncio.sleep(remaining)
                                 break
