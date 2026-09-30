@@ -153,6 +153,42 @@ DEFAULT_TIMEOUT = 300
 # 等不到说明 x5secdata 已失效或该账号当前已不在风控状态。
 CAPTCHA_PRESENT_TIMEOUT = 20
 
+# 挑战有效期（秒）：实测拖动超过约 5 分钟后服务端不再接受（不发凭证）。
+# 用于判断「拖得太晚」并向用户报告晚了多久。
+CHALLENGE_TTL_SECONDS = 300
+# 拖动确认无效后，几秒内在同一窗口换新滑块（给Cookie一点落地宽限）
+DEAD_DRAG_RENAVIGATE_DELAY = 5
+
+
+async def _show_page_banner(page, text: str) -> None:
+    """在验证窗口顶部显示一条状态横幅。
+
+    用户正盯着这个窗口，反馈必须出现在他看的地方，而不是只写日志。
+    （2026-09-30 用户反馈：拖晚了没有任何提示，不知道要不要重扫、
+    要不要关窗口 —— 需要当场告诉他晚了多久、接下来会发生什么。）
+    """
+    try:
+        await page.evaluate(
+            """(text) => {
+                try {
+                    var b = document.getElementById('__xy_banner');
+                    if (!b) {
+                        b = document.createElement('div');
+                        b.id = '__xy_banner';
+                        b.style.cssText = 'position:fixed;top:0;left:0;right:0;'
+                            + 'z-index:2147483647;background:#1a73e8;color:#fff;'
+                            + 'font:14px/1.7 system-ui,sans-serif;padding:10px 16px;'
+                            + 'text-align:center;box-shadow:0 2px 8px rgba(0,0,0,.35)';
+                        (document.body || document.documentElement).appendChild(b);
+                    }
+                    b.textContent = text;
+                } catch (e) {}
+            }""",
+            text,
+        )
+    except Exception:
+        pass
+
 
 def get_verification_url(cookie_id: str) -> Optional[str]:
     """从风控日志里取该账号最近一次滑块惩罚的 URL。
@@ -425,6 +461,15 @@ async def open_manual_session(
             f"【{cookie_id}】已开启人工验证会话，请在 {timeout} 秒内于"
             f" /static/captcha_control.html?session={session_id} 完成验证"
         )
+        # 反馈必须出现在用户正盯着的地方：窗口顶部横幅。日志他看不见。
+        await _show_page_banner(
+            page,
+            f"请尽快拖动滑块（挑战约 {CHALLENGE_TTL_SECONDS // 60} 分钟即过期；"
+            f"拖晚了会自动换新的，不用关窗口）",
+        )
+
+        # 挑战下发时刻：用于计算「拖晚了多久」并判断是否已过期
+        challenge_issued_at = time.monotonic()
 
         # 关键：会话期间浏览器必须保持存活，等用户拖完才返回。
         # 原实现在这里死等 timeout，且 check_completion 在无滑块时误判完成
@@ -445,11 +490,13 @@ async def open_manual_session(
         # 哪个域？是否跳到了 taobao？）。变化才记，不刷屏。
         last_jar: Optional[dict] = None
         last_page_url: Optional[str] = None
-        # 【过期自愈】挑战约 5 分钟过期：拖得太慢时页面看着过了，
-        # 服务端早已丢弃、不会下发通行证（2026-09-30 实测 7.5 分钟后
-        # 拖动一无所获）。元素消失超过 15 秒仍无 x5sec 就在**同一窗口**
-        # 重新加载新滑块让用户再拖，而不是干等到超时。
+        # 【拖晚自愈】拖动未被接受（元素消失但无新 x5sec）时：当场告诉
+        # 用户晚了多久、几秒后自动换新滑块（同一个窗口），不用关窗口、
+        # 不用重新扫码。2026-09-30 实测：用户在挑战下发 7.5~9.8 分钟后才拖，
+        # 挑战约 5 分钟即过期，页面看着拖过去了但服务端不发凭证。
         elements_gone_at: Optional[float] = None
+        dead_drag_at: Optional[float] = None
+        next_probe_not_before = 0.0
         renavigations = 0
         render_grace_until = 0.0
         RENAVIGATE_LIMIT = 5
@@ -527,58 +574,92 @@ async def open_manual_session(
                             )
                             completed = True
                             break
-                    if not completed:
-                        logger.warning(
-                            f"【{cookie_id}】滑块元素已消失，但 Cookie 里仍未出现 goofish x5sec，"
-                            f"继续等待人工完成（不要关窗口）"
-                        )
-                        # 【过期自愈】元素消失超过 15 秒仍无 x5sec：大概率挑战
-                        # 已过期（拖得太慢，服务端不发通行证）。同一窗口里加载
-                        # 新滑块让用户再拖，而不是干等到超时。
-                        now_mono = time.monotonic()
-                        if elements_gone_at is None:
-                            elements_gone_at = now_mono
-                        elif (
-                            now_mono - elements_gone_at > 15
-                            and renavigations < RENAVIGATE_LIMIT
-                            and now_mono > render_grace_until
-                        ):
-                            fresh_url = await _fetch_live_verification_url(
-                                cookie_id, cookies_str
-                            )
-                            if fresh_url:
-                                try:
-                                    await page.goto(
-                                        fresh_url, wait_until="domcontentloaded", timeout=60000
-                                    )
-                                    renavigations += 1
-                                    elements_gone_at = None
-                                    render_grace_until = time.monotonic() + 30
-                                    logger.warning(
-                                        f"【{cookie_id}】滑块已消失超过 15 秒且未取得 x5sec"
-                                        f"（大概率挑战已过期），已在同一窗口加载新的滑块"
-                                        f"（第 {renavigations} 次），请尽快拖动"
-                                    )
-                                except Exception as nav_exc:
-                                    logger.warning(f"【{cookie_id}】重新加载滑块失败: {nav_exc}")
-                                    elements_gone_at = now_mono
-                            else:
-                                logger.warning(
-                                    f"【{cookie_id}】实时探测未返回新惩罚 URL"
-                                    f"（账号可能已恢复，或探测失败），稍后再试"
-                                )
-                                elements_gone_at = now_mono
                     if completed:
                         break
+                    # 元素消失但没有新 x5sec —— 这次拖动没被服务端接受。
+                    # 当场告诉用户原因（晚了多久），并准备自动换新滑块。
+                    if elements_gone_at is None:
+                        elements_gone_at = time.monotonic()
+                    if dead_drag_at is None:
+                        dead_drag_at = time.monotonic()
+                        took = dead_drag_at - challenge_issued_at
+                        mm, ss = int(took // 60), int(took % 60)
+                        if took > CHALLENGE_TTL_SECONDS:
+                            reason = (
+                                f"拖得太晚：挑战已下发 {mm} 分 {ss} 秒"
+                                f"（约 {CHALLENGE_TTL_SECONDS // 60} 分钟即过期），这次拖动无效"
+                            )
+                        else:
+                            reason = f"拖动未被服务端接受（挑战已下发 {mm} 分 {ss} 秒）"
+                        logger.warning(
+                            f"【{cookie_id}】{reason}；{DEAD_DRAG_RENAVIGATE_DELAY} 秒后"
+                            f"在同一窗口自动加载新滑块（不用关窗口、不用重新扫码）"
+                        )
+                        await _show_page_banner(
+                            page,
+                            f"⚠ {reason}；{DEAD_DRAG_RENAVIGATE_DELAY} 秒后自动换新滑块，"
+                            f"请准备好（别关窗口）",
+                        )
                 else:
-                    # 滑块还在（或新滑块已渲染）—— 重置过期计时
+                    # 滑块还在（或新滑块已渲染）—— 重置拖动状态
                     elements_gone_at = None
+                    dead_drag_at = None
             except Exception as exc:
                 logger.debug(f"【{cookie_id}】检查验证完成状态失败: {exc}")
+
+            # 拖动已确认无效：短暂等待后同窗口换新滑块
+            if dead_drag_at is not None:
+                now_mono = time.monotonic()
+                if (
+                    now_mono - dead_drag_at > DEAD_DRAG_RENAVIGATE_DELAY
+                    and now_mono > render_grace_until
+                    and now_mono > next_probe_not_before
+                    and renavigations < RENAVIGATE_LIMIT
+                ):
+                    fresh_url = await _fetch_live_verification_url(cookie_id, cookies_str)
+                    if fresh_url:
+                        try:
+                            await page.goto(
+                                fresh_url, wait_until="domcontentloaded", timeout=60000
+                            )
+                            renavigations += 1
+                            challenge_issued_at = time.monotonic()
+                            dead_drag_at = None
+                            elements_gone_at = None
+                            render_grace_until = time.monotonic() + 30
+                            logger.warning(
+                                f"【{cookie_id}】已在同一窗口加载新的滑块（第 {renavigations} 次），"
+                                f"请尽快拖动（挑战约 {CHALLENGE_TTL_SECONDS // 60} 分钟即过期）"
+                            )
+                            await _show_page_banner(
+                                page,
+                                f"已换新滑块（第 {renavigations} 次）！请尽快拖动 —— "
+                                f"约 {CHALLENGE_TTL_SECONDS // 60} 分钟即过期，拖晚了会再自动换",
+                            )
+                        except Exception as nav_exc:
+                            logger.warning(f"【{cookie_id}】重新加载滑块失败: {nav_exc}")
+                            dead_drag_at = now_mono
+                    else:
+                        next_probe_not_before = now_mono + 30
+                        logger.warning(
+                            f"【{cookie_id}】未能获取新滑块（账号可能已恢复，或仍在风控冷却），"
+                            f"30 秒后重试"
+                        )
+                        await _show_page_banner(
+                            page,
+                            "未能获取新滑块（账号可能已恢复或风控冷却中），稍后自动重试…",
+                        )
 
         if not completed:
             result["message"] = f"人工验证超时（{timeout} 秒内未通过，或未取得 x5sec）"
             logger.warning(f"【{cookie_id}】{result['message']}")
+            # 超时也要告诉用户接下来会发生什么，并在窗口里留几秒让他读完
+            await _show_page_banner(
+                page,
+                f"⏰ {timeout} 秒内未完成验证，本会话结束，窗口即将关闭。"
+                f"稍后会再自动弹出新窗口重试；若不再弹出，请到「账号管理」重新扫码登录",
+            )
+            await asyncio.sleep(6)
             return result
 
         # 用**检测到 x5sec 那一刻**抓下的 goofish 域快照，而不是现在再读
@@ -606,6 +687,11 @@ async def open_manual_session(
         result["cookies_str"] = new_cookies
         result["message"] = "人工验证完成"
         logger.info(f"【{cookie_id}】人工验证完成，已取得新 Cookie")
+        # 成功也要给用户看得见的确认，留 2 秒让他看到再关窗
+        await _show_page_banner(
+            page, "✅ 验证成功！新 Cookie 已保存，账号即将自动恢复，窗口即将关闭"
+        )
+        await asyncio.sleep(2)
         return result
     except Exception as exc:
         result["message"] = f"人工验证会话异常: {exc}"

@@ -358,3 +358,46 @@ class StealthInjectionTests(unittest.TestCase):
         inject_at = body.find('add_init_script')
         newpage_at = body.find('await context.new_page()')
         self.assertLess(inject_at, newpage_at, '反检测脚本必须在 new_page 之前注入')
+
+
+class LateDragFeedbackTests(unittest.TestCase):
+    """回归：拖晚了必须当场告诉用户，并说明后续动作。
+
+    2026-09-30 用户反馈：拖晚了没有任何提示，不知道该关窗口、
+    重新扫码还是干等。要求：提示「拖晚了/晚了多久」+ 后续是
+    自动换新滑块（同窗口），不需要清会话、不需要重新扫码。
+    """
+
+    def test_banner_helper_exists(self):
+        import pathlib
+
+        src = pathlib.Path('utils/manual_captcha.py').read_text(encoding='utf-8')
+        self.assertIn('async def _show_page_banner', src)
+        # 关键反馈点必须都在窗口横幅里出现（用户看的是窗口，不是日志）
+        for needle in (
+            '拖得太晚：挑战已下发',          # 晚了多久
+            '自动换新滑块',                  # 后续动作（同窗口换新）
+            '未完成验证，本会话结束',        # 超时说明
+            '重新扫码登录',                  # 兜底路径指引
+            '验证成功！新 Cookie 已保存',     # 成功确认
+        ):
+            self.assertIn(needle, src, f'缺少用户反馈: {needle}')
+
+    def test_challenge_ttl_and_dead_drag_constants(self):
+        import pathlib
+        import re
+
+        src = pathlib.Path('utils/manual_captcha.py').read_text(encoding='utf-8')
+        m = re.search(r'CHALLENGE_TTL_SECONDS\s*=\s*(\d+)', src)
+        self.assertIsNotNone(m)
+        self.assertEqual(int(m.group(1)), 300, '挑战有效期应为约 5 分钟')
+        m2 = re.search(r'DEAD_DRAG_RENAVIGATE_DELAY\s*=\s*(\d+)', src)
+        self.assertIsNotNone(m2)
+        self.assertLessEqual(int(m2.group(1)), 10, '确认无效后应尽快换新滑块')
+
+    def test_dead_drag_resets_when_slider_reappears(self):
+        import pathlib
+
+        src = pathlib.Path('utils/manual_captcha.py').read_text(encoding='utf-8')
+        # 新滑块渲染出来（元素在）时必须重置 dead_drag_at，避免误换
+        self.assertRegex(src, r'else:\s*\n\s+# 滑块还在（或新滑块已渲染）—— 重置拖动状态\s*\n\s+elements_gone_at = None\s*\n\s+dead_drag_at = None')
