@@ -21,8 +21,57 @@ from app.config import browser_headless
 from utils.xianyu_utils import trans_cookies
 
 
-def _x5sec_values(browser_cookies) -> set:
-    """取浏览器 Cookie 里所有 x5sec 的取值集合。"""
+# goofish 的 Cookie 域名（包含子域）。滑块通过后的 x5sec 只在这个域上有效。
+_GOOFISH_DOMAINS = ('.goofish.com', 'goofish.com')
+
+
+def _is_goofish_cookie(cookie) -> bool:
+    """该 Cookie 是否属于 goofish 域。
+
+    必须区分域：滑块通过后惩罚页会 302 到 taobao.com，那里也会下发一个
+    同名 x5sec（aserver/device 令牌）。不分域地拼回字符串就会把它当成
+    goofish 的挑战凭证存回账号，token 刷新依旧被拒。
+    """
+    if not isinstance(cookie, dict):
+        return False
+    domain = str(cookie.get('domain') or '').lower().lstrip('.')
+    if not domain:
+        # 没有域的（部分上下文）保守放行，交给后续 x5sec 校验兜底
+        return True
+    return any(domain == d.lstrip('.') or domain.endswith('.' + d.lstrip('.'))
+               for d in _GOOFISH_DOMAINS)
+
+
+async def _goofish_cookies_snapshot(context) -> dict:
+    """抓下当前浏览器里 goofish 域的全部 Cookie（name -> value）。
+
+    时机很关键：要在检测到新 x5sec 的**那一瞬**调用，晚一步就可能已经
+    重定向到 taobao.com 了。
+    """
+    try:
+        cookies = await context.cookies()
+    except Exception:
+        return {}
+    return {
+        str(c.get('name')): str(c.get('value', ''))
+        for c in cookies
+        if isinstance(c, dict) and c.get('name') and _is_goofish_cookie(c)
+    }
+
+
+def _from_cookie_snapshot(snapshot: dict) -> str:
+    """把 name->value 快照拼成 Cookie 字符串。"""
+    if not snapshot:
+        return ''
+    return '; '.join(f'{k}={v}' for k, v in snapshot.items())
+
+
+def _x5sec_values(browser_cookies, domain_only: bool = False) -> set:
+    """取浏览器 Cookie 里所有 x5sec 的取值集合。
+
+    domain_only=True 时只看 goofish 域 —— taobao 域也有同名 x5sec，
+    混进来会误判“滑块已过”。
+    """
     if not browser_cookies:
         return set()
     return {
@@ -30,10 +79,11 @@ def _x5sec_values(browser_cookies) -> set:
         for item in browser_cookies
         if isinstance(item, dict)
         and str(item.get('name', '')).lower() == 'x5sec'
+        and (not domain_only or _is_goofish_cookie(item))
     }
 
 
-def _has_new_x5sec(browser_cookies, baseline: set) -> bool:
+def _has_new_x5sec(browser_cookies, baseline: set, domain_only: bool = False) -> bool:
     """服务端是否**新发**了一个 x5sec（滑块真正通过的凭证）。
 
     绝不能只判「Cookie 里有没有 x5sec」：账号 Cookie 里往往带着上一次通过时
@@ -43,7 +93,7 @@ def _has_new_x5sec(browser_cookies, baseline: set) -> bool:
 
     所以只有在 x5sec 的**取值**相对注入前发生变化时才算法成功。
     """
-    current = _x5sec_values(browser_cookies)
+    current = _x5sec_values(browser_cookies, domain_only=domain_only)
     if not current:
         return False
     return any(value and value not in baseline for value in current)
@@ -318,12 +368,17 @@ async def open_manual_session(
         # 穿过滑块的唯一权威凭证是 Cookie 里出现 x5sec，所以以它为准。
         deadline = time.monotonic() + timeout
         completed = False
+        goofish_snapshot: dict = {}
         while time.monotonic() < deadline:
-            await asyncio.sleep(2)
+            await asyncio.sleep(1)
             try:
-                if _has_new_x5sec(await context.cookies(), baseline_x5sec):
+                fresh = _x5sec_values(await context.cookies(), domain_only=True)
+                if {v for v in fresh if v and v not in baseline_x5sec}:
+                    # 立即从浏览器里取出 **goofish 域** 的全部 cookie 存下来，
+                    # 不等后续重定向污染 cookie jar。
+                    goofish_snapshot = await _goofish_cookies_snapshot(context)
                     completed = True
-                    logger.info(f"【{cookie_id}】检测到新的 x5sec，滑块验证已完成")
+                    logger.info(f"【{cookie_id}】检测到新的 goofish x5sec，滑块验证已完成")
                     break
             except Exception as exc:
                 logger.debug(f"【{cookie_id}】读取浏览器 Cookie 失败: {exc}")
@@ -334,12 +389,14 @@ async def open_manual_session(
                     # 这里给一次短暂宽限：可能刚好拖完、Cookie 还在落盘。
                     for _ in range(3):
                         await asyncio.sleep(1)
-                        if _has_new_x5sec(await context.cookies(), baseline_x5sec):
+                        fresh = _x5sec_values(await context.cookies(), domain_only=True)
+                        if {v for v in fresh if v and v not in baseline_x5sec}:
+                            goofish_snapshot = await _goofish_cookies_snapshot(context)
                             completed = True
                             break
                     if not completed:
                         logger.warning(
-                            f"【{cookie_id}】滑块元素已消失，但 Cookie 里仍未出现 x5sec，"
+                            f"【{cookie_id}】滑块元素已消失，但 Cookie 里仍未出现 goofish x5sec，"
                             f"继续等待人工完成（不要关窗口）"
                         )
                     if completed:
@@ -352,7 +409,15 @@ async def open_manual_session(
             logger.warning(f"【{cookie_id}】{result['message']}")
             return result
 
-        new_cookies = _from_playwright_cookies(await context.cookies())
+        # 用**检测到 x5sec 那一刻**抓下的 goofish 域快照，而不是现在再读
+        # context.cookies()：此刻页面可能已 302 到 taobao.com，那里的 x5sec
+        # 是 aserver 令牌，存回账号会让 goofish 继续拒绝（表现为“每过完一次
+        # 滑块又弹一次”）。
+        new_cookies = _from_cookie_snapshot(goofish_snapshot)
+        if not new_cookies:
+            new_cookies = _from_playwright_cookies(
+                [c for c in await context.cookies() if _is_goofish_cookie(c)]
+            )
         if not new_cookies:
             result["message"] = "验证已完成但未取到 Cookie"
             return result
