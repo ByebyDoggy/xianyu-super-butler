@@ -72,6 +72,35 @@ def trans_cookies(cookies_str: str) -> dict:
 CAPTCHA_CHALLENGE_COOKIES = ('x5secdata', 'x5sectag', 'x5step')
 
 
+def strip_captcha_challenge_cookies(cookies_str: str) -> str:
+    """**无条件**移除挑战标记 Cookie（x5secdata/x5sectag/x5step）。
+
+    与 drop_stale_captcha_challenge 的区别：那个在有 x5sec 时才清理，
+    这个无条件清理 —— 用于任何要落库 / 要随 API 请求发送的场景。
+
+    为什么必须无条件：FAIL_SYS_USER_VALIDATE 的响应会通过 set-cookie 把
+    标记塞回来，一旦落库，后续每个请求都带着「验证未完成」的标记，
+    平台继续拒绝 —— 2026-09-30 实测：滑块过了也不恢复、验证码窗口
+    无限弹，根因之一就是响应合并把标记又写回了库。
+    """
+    if not cookies_str:
+        return cookies_str
+    parts = [p.strip() for p in cookies_str.split(';') if p.strip()]
+    kept = [
+        p for p in parts
+        if p.split('=', 1)[0].strip().lower() not in CAPTCHA_CHALLENGE_COOKIES
+    ]
+    return '; '.join(kept)
+
+
+def strip_challenge_markers_from_dict(cookies: dict) -> list:
+    """就地从 Cookie 字典里移除挑战标记，返回被移除的键列表。"""
+    dropped = [k for k in list(cookies) if str(k).lower() in CAPTCHA_CHALLENGE_COOKIES]
+    for k in dropped:
+        cookies.pop(k, None)
+    return dropped
+
+
 def drop_stale_captcha_challenge(cookies_str: str) -> str:
     """拿到 x5sec 后清掉遗留的验证挑战标记，返回新的 Cookie 字符串。
 

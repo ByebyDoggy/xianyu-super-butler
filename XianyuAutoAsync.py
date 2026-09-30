@@ -853,11 +853,16 @@ class XianyuLive:
             raise ValueError("未提供cookies，请在global_config.yml中配置COOKIES_STR或通过参数传入")
 
         logger.info(f"【{cookie_id}】解析cookies...")
+        # 启动时就清一次挑战标记：库里可能残留旧版本写入的
+        # x5secdata/x5sectag（携带它们发请求会被平台判定「验证未完成」）
+        from utils.xianyu_utils import strip_captcha_challenge_cookies, strip_challenge_markers_from_dict
+        cookies_str = strip_captcha_challenge_cookies(cookies_str)
         self.cookies = trans_cookies(cookies_str)
+        strip_challenge_markers_from_dict(self.cookies)
         logger.info(f"【{cookie_id}】cookies解析完成，包含字段: {list(self.cookies.keys())}")
 
         self.cookie_id = cookie_id  # 唯一账号标识
-        self.cookies_str = cookies_str  # 保存原始cookie字符串
+        self.cookies_str = cookies_str  # 保存原始cookie字符串（已去挑战标记）
         self.user_id = user_id  # 保存用户ID，用于token刷新时保持正确的所有者关系
         self.base_url = WEBSOCKET_URL
 
@@ -2507,6 +2512,16 @@ class XianyuLive:
                         self.cookies_str = new_cookies_str
                         # 更新cookies字典
                         self.cookies = trans_cookies(self.cookies_str)
+                        # 库里可能残留挑战标记（旧版本写入的），同样不能随请求发送
+                        from utils.xianyu_utils import strip_challenge_markers_from_dict
+                        _dropped = strip_challenge_markers_from_dict(self.cookies)
+                        if _dropped:
+                            self.cookies_str = '; '.join(
+                                f"{k}={v}" for k, v in self.cookies.items()
+                            )
+                            logger.info(
+                                f"【{self.cookie_id}】重载时丢弃挑战标记: {', '.join(_dropped)}"
+                            )
                         logger.warning(f"【{self.cookie_id}】Cookie已从数据库重新加载")
             except Exception as reload_e:
                 logger.warning(f"【{self.cookie_id}】从数据库重新加载cookie失败，继续使用当前cookie: {self._safe_str(reload_e)}")
@@ -3502,6 +3517,25 @@ class XianyuLive:
         """更新数据库中的cookies（不会覆盖账号密码等其他字段）"""
         try:
             from app.db_manager import db_manager
+            from utils.xianyu_utils import strip_challenge_markers_from_dict
+
+            # 【安全网】挑战标记 Cookie（x5secdata/x5sectag/x5step）绝不能
+            # 入库、也不能留在请求头里。所有 set-cookie 合并点（token 刷新/
+            # 商品同步/订单详情）都会经过这里落库；FAIL_SYS_USER_VALIDATE 的
+            # 响应会把标记塞回来，一旦落库，后续每个请求都带着
+            # 「验证未完成」的标记，平台会继续拒绝 —— 2026-09-30 实测：
+            # 滑块过了也不恢复、验证码窗口无限弹。
+            dropped = strip_challenge_markers_from_dict(self.cookies)
+            if dropped:
+                self.cookies_str = '; '.join(
+                    f"{k}={v}" for k, v in self.cookies.items()
+                )
+                if getattr(self, 'session', None) and not self.session.closed:
+                    self.session.headers['cookie'] = self.cookies_str
+                logger.info(
+                    f"【{self.cookie_id}】已丢弃挑战标记 Cookie"
+                    f"（不随请求发送、不入库）: {', '.join(dropped)}"
+                )
 
             # 更新数据库中的Cookie
             if hasattr(self, 'cookie_id') and self.cookie_id:
@@ -9071,6 +9105,9 @@ class XianyuLive:
 
             # 生成真实cookie字符串
             real_cookies_str = '; '.join([f"{k}={v}" for k, v in real_cookies_dict.items()])
+            # 扫码登录过程中若弹过验证，Cookie 里会残留挑战标记，绝不能落库
+            from utils.xianyu_utils import strip_captcha_challenge_cookies
+            real_cookies_str = strip_captcha_challenge_cookies(real_cookies_str)
 
             logger.info(f"【{target_cookie_id}】真实Cookie已获取，包含 {len(real_cookies_dict)} 个字段")
 
@@ -9459,6 +9496,9 @@ class XianyuLive:
 
             # 生成真实cookie字符串
             real_cookies_str = '; '.join([f"{k}={v}" for k, v in real_cookies_dict.items()])
+            # 扫码登录过程中若弹过验证，Cookie 里会残留挑战标记，绝不能落库
+            from utils.xianyu_utils import strip_captcha_challenge_cookies
+            real_cookies_str = strip_captcha_challenge_cookies(real_cookies_str)
 
             logger.info(f"【{self.cookie_id}】真实Cookie已获取，包含 {len(real_cookies_dict)} 个字段")
             logger.info(

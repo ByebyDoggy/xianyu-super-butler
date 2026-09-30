@@ -42,21 +42,48 @@ def _is_goofish_cookie(cookie) -> bool:
                for d in _GOOFISH_DOMAINS)
 
 
-async def _goofish_cookies_snapshot(context) -> dict:
+async def _goofish_cookies_snapshot(context, prefer: Optional[dict] = None) -> dict:
     """抓下当前浏览器里 goofish 域的全部 Cookie（name -> value）。
 
     时机很关键：要在检测到新 x5sec 的**那一瞬**调用，晚一步就可能已经
     重定向到 taobao.com 了。
+
+    同名 Cookie 可能在**不同域**各有一份：注入的账号 Cookie 都挂在
+    ``.goofish.com``，而惩罚页新下发的通行证 x5sec 常挂在
+    ``h5api.m.goofish.com``（host-only）。旧实现用 ``{name: value}``
+    字典直存，两份同名 x5sec 只留一份、谁留下全看遍历顺序 ——
+    2026-09-30 实测留下的正是注入的**旧**值，刚拖完滑块拿到的新
+    x5sec 被丢掉，落库后平台照样拒绝，于是「每过完一次滑块又弹一次」。
+    现在同名时取**域更具体**（域名串更长）的那份，并把检测到的新
+    x5sec 通过 ``prefer`` 强制写回，双保险。
     """
     try:
         cookies = await context.cookies()
     except Exception:
         return {}
-    return {
-        str(c.get('name')): str(c.get('value', ''))
-        for c in cookies
-        if isinstance(c, dict) and c.get('name') and _is_goofish_cookie(c)
-    }
+    snapshot = _dedup_goofish(cookies)
+    if prefer:
+        for name, value in prefer.items():
+            if value:
+                snapshot[str(name)] = str(value)
+    return snapshot
+
+
+def _dedup_goofish(cookies_list) -> dict:
+    """把 goofish 域 Cookie 列表去重成 name -> value。
+
+    同名 Cookie 跨域共存时取**域更具体**的那份（域名串更长）：浏览器发给
+    API 的正是它。顺序无关，不受 context.cookies() 遍历顺序影响。
+    """
+    best: dict = {}
+    for c in cookies_list or []:
+        if not (isinstance(c, dict) and c.get('name') and _is_goofish_cookie(c)):
+            continue
+        name = str(c['name'])
+        domain = str(c.get('domain') or '')
+        if name not in best or len(domain) > len(best[name][0]):
+            best[name] = (domain, str(c.get('value', '')))
+    return {k: v for k, (_, v) in best.items()}
 
 
 def _from_cookie_snapshot(snapshot: dict) -> str:
@@ -72,15 +99,34 @@ def _x5sec_values(browser_cookies, domain_only: bool = False) -> set:
     domain_only=True 时只看 goofish 域 —— taobao 域也有同名 x5sec，
     混进来会误判“滑块已过”。
     """
+    return set(_x5sec_entries(browser_cookies, domain_only=domain_only).keys())
+
+
+def _x5sec_entries(browser_cookies, domain_only: bool = False) -> dict:
+    """取浏览器 Cookie 里所有 x5sec 的 {取值: 域名} 映射。
+
+    需要域名是为了在同名多份时挑**域更具体**（更接近 API 域）的那份。
+    """
     if not browser_cookies:
-        return set()
+        return {}
     return {
-        str(item.get('value', ''))
+        str(item.get('value', '')): str(item.get('domain') or '')
         for item in browser_cookies
         if isinstance(item, dict)
         and str(item.get('name', '')).lower() == 'x5sec'
         and (not domain_only or _is_goofish_cookie(item))
     }
+
+
+def _pick_new_x5sec(entries: dict, baseline: set) -> str:
+    """从 {取值: 域名} 里挑出基线之外的新 x5sec，域更具体者优先。
+
+    返回空串表示没有新值（验证未完成）。
+    """
+    new_entries = {v: d for v, d in entries.items() if v and v not in baseline}
+    if not new_entries:
+        return ''
+    return max(new_entries.items(), key=lambda kv: len(kv[1]))[0]
 
 
 def _has_new_x5sec(browser_cookies, baseline: set, domain_only: bool = False) -> bool:
@@ -372,11 +418,16 @@ async def open_manual_session(
         while time.monotonic() < deadline:
             await asyncio.sleep(1)
             try:
-                fresh = _x5sec_values(await context.cookies(), domain_only=True)
-                if {v for v in fresh if v and v not in baseline_x5sec}:
+                fresh_entries = _x5sec_entries(await context.cookies(), domain_only=True)
+                new_x5sec = _pick_new_x5sec(fresh_entries, baseline_x5sec)
+                if new_x5sec:
                     # 立即从浏览器里取出 **goofish 域** 的全部 cookie 存下来，
-                    # 不等后续重定向污染 cookie jar。
-                    goofish_snapshot = await _goofish_cookies_snapshot(context)
+                    # 不等后续重定向污染 cookie jar；并把刚检测到的新 x5sec
+                    # 强制写进快照（prefer）—— 同名多份时去重顺序不可靠，
+                    # 2026-09-30 实测会把注入的旧值存回去、丢掉新通行证。
+                    goofish_snapshot = await _goofish_cookies_snapshot(
+                        context, prefer={'x5sec': new_x5sec}
+                    )
                     completed = True
                     logger.info(f"【{cookie_id}】检测到新的 goofish x5sec，滑块验证已完成")
                     break
@@ -389,9 +440,12 @@ async def open_manual_session(
                     # 这里给一次短暂宽限：可能刚好拖完、Cookie 还在落盘。
                     for _ in range(3):
                         await asyncio.sleep(1)
-                        fresh = _x5sec_values(await context.cookies(), domain_only=True)
-                        if {v for v in fresh if v and v not in baseline_x5sec}:
-                            goofish_snapshot = await _goofish_cookies_snapshot(context)
+                        fresh_entries = _x5sec_entries(await context.cookies(), domain_only=True)
+                        new_x5sec = _pick_new_x5sec(fresh_entries, baseline_x5sec)
+                        if new_x5sec:
+                            goofish_snapshot = await _goofish_cookies_snapshot(
+                                context, prefer={'x5sec': new_x5sec}
+                            )
                             completed = True
                             break
                     if not completed:
@@ -415,9 +469,9 @@ async def open_manual_session(
         # 滑块又弹一次”）。
         new_cookies = _from_cookie_snapshot(goofish_snapshot)
         if not new_cookies:
-            new_cookies = _from_playwright_cookies(
-                [c for c in await context.cookies() if _is_goofish_cookie(c)]
-            )
+            # 兜底同样要同名去重（域更具体者优先），不能裸拼：
+            # 同名 x5sec 多份时顺序决定谁被留下，不可靠。
+            new_cookies = _from_cookie_snapshot(_dedup_goofish(await context.cookies()))
         if not new_cookies:
             result["message"] = "验证已完成但未取到 Cookie"
             return result

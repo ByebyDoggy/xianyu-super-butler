@@ -3110,6 +3110,11 @@ async def login_with_pasted_cookie(
         if not line:
             return {'success': False, 'message': 'Cookie 不能为空'}
 
+        # 用户从浏览器复制的 Cookie 可能带着挑战标记（x5secdata 等），
+        # 携带它们发请求会被平台判定「验证未完成」，直接拒收 —— 入库前清掉
+        from utils.xianyu_utils import strip_captcha_challenge_cookies
+        line = strip_captcha_challenge_cookies(line)
+
         cookie_fields = trans_cookies(line)
         if not cookie_fields:
             return {'success': False, 'message': 'Cookie 无法解析，格式应为 name=value; name2=value2'}
