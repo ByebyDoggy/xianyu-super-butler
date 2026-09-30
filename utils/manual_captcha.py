@@ -415,25 +415,80 @@ async def open_manual_session(
         deadline = time.monotonic() + timeout
         completed = False
         goofish_snapshot: dict = {}
+        # 【诊断】记录浏览器任意域的 Cookie 变化与页面跳转。
+        # 2026-09-30 实测：用户拖完滑块、元素消失，但始终没出现新的
+        # goofish x5sec —— 没有这些日志只能靠猜（页面到底把凭证发到了
+        # 哪个域？是否跳到了 taobao？）。变化才记，不刷屏。
+        last_jar: Optional[dict] = None
+        last_page_url: Optional[str] = None
+        # 【过期自愈】挑战约 5 分钟过期：拖得太慢时页面看着过了，
+        # 服务端早已丢弃、不会下发通行证（2026-09-30 实测 7.5 分钟后
+        # 拖动一无所获）。元素消失超过 15 秒仍无 x5sec 就在**同一窗口**
+        # 重新加载新滑块让用户再拖，而不是干等到超时。
+        elements_gone_at: Optional[float] = None
+        renavigations = 0
+        render_grace_until = 0.0
+        RENAVIGATE_LIMIT = 5
         while time.monotonic() < deadline:
             await asyncio.sleep(1)
+            all_cookies = None
             try:
-                fresh_entries = _x5sec_entries(await context.cookies(), domain_only=True)
-                new_x5sec = _pick_new_x5sec(fresh_entries, baseline_x5sec)
-                if new_x5sec:
-                    # 立即从浏览器里取出 **goofish 域** 的全部 cookie 存下来，
-                    # 不等后续重定向污染 cookie jar；并把刚检测到的新 x5sec
-                    # 强制写进快照（prefer）—— 同名多份时去重顺序不可靠，
-                    # 2026-09-30 实测会把注入的旧值存回去、丢掉新通行证。
-                    goofish_snapshot = await _goofish_cookies_snapshot(
-                        context, prefer={'x5sec': new_x5sec}
-                    )
-                    completed = True
-                    logger.info(f"【{cookie_id}】检测到新的 goofish x5sec，滑块验证已完成")
-                    break
+                all_cookies = await context.cookies()
             except Exception as exc:
                 logger.debug(f"【{cookie_id}】读取浏览器 Cookie 失败: {exc}")
-                continue
+            if all_cookies is not None:
+                # ---- 诊断：任意域 Cookie 变化 ----
+                try:
+                    jar = {
+                        (str(c['name']), str(c.get('domain') or '')): str(c.get('value', ''))[:24]
+                        for c in all_cookies if isinstance(c, dict) and c.get('name')
+                    }
+                    if last_jar is None:
+                        last_jar = jar
+                    else:
+                        for k, v in sorted(jar.items()):
+                            if k not in last_jar:
+                                logger.info(f"【{cookie_id}】[诊断] Cookie 新增: {k[0]}@{k[1]}={v}…")
+                            elif last_jar[k] != v:
+                                logger.info(
+                                    f"【{cookie_id}】[诊断] Cookie 变更: {k[0]}@{k[1]}:"
+                                    f" {last_jar[k]}… → {v}…"
+                                )
+                        for k in sorted(last_jar):
+                            if k not in jar:
+                                logger.info(f"【{cookie_id}】[诊断] Cookie 移除: {k[0]}@{k[1]}")
+                        last_jar = jar
+                except Exception:
+                    pass
+                # ---- x5sec 检测（goofish 域，取新值） ----
+                try:
+                    fresh_entries = _x5sec_entries(all_cookies, domain_only=True)
+                    new_x5sec = _pick_new_x5sec(fresh_entries, baseline_x5sec)
+                    if new_x5sec:
+                        # 立即从浏览器里取出 **goofish 域** 的全部 cookie 存下来，
+                        # 不等后续重定向污染 cookie jar；并把刚检测到的新 x5sec
+                        # 强制写进快照（prefer）—— 同名多份时去重顺序不可靠，
+                        # 2026-09-30 实测会把注入的旧值存回去、丢掉新通行证。
+                        goofish_snapshot = await _goofish_cookies_snapshot(
+                            context, prefer={'x5sec': new_x5sec}
+                        )
+                        completed = True
+                        logger.info(f"【{cookie_id}】检测到新的 goofish x5sec，滑块验证已完成")
+                        break
+                except Exception as exc:
+                    logger.debug(f"【{cookie_id}】检查新 x5sec 失败: {exc}")
+            # ---- 诊断：页面跳转 ----
+            try:
+                url_now = page.url
+                if last_page_url is None:
+                    last_page_url = url_now
+                elif url_now != last_page_url:
+                    logger.info(
+                        f"【{cookie_id}】[诊断] 页面跳转: …{last_page_url[-80:]} → …{url_now[-80:]}"
+                    )
+                    last_page_url = url_now
+            except Exception:
+                pass
             try:
                 if await captcha_controller.check_completion(session_id):
                     # 元素消失 ≠ 验证通过（可能只是页面抖动），必须以 x5sec 为准。
@@ -453,8 +508,47 @@ async def open_manual_session(
                             f"【{cookie_id}】滑块元素已消失，但 Cookie 里仍未出现 goofish x5sec，"
                             f"继续等待人工完成（不要关窗口）"
                         )
+                        # 【过期自愈】元素消失超过 15 秒仍无 x5sec：大概率挑战
+                        # 已过期（拖得太慢，服务端不发通行证）。同一窗口里加载
+                        # 新滑块让用户再拖，而不是干等到超时。
+                        now_mono = time.monotonic()
+                        if elements_gone_at is None:
+                            elements_gone_at = now_mono
+                        elif (
+                            now_mono - elements_gone_at > 15
+                            and renavigations < RENAVIGATE_LIMIT
+                            and now_mono > render_grace_until
+                        ):
+                            fresh_url = await _fetch_live_verification_url(
+                                cookie_id, cookies_str
+                            )
+                            if fresh_url:
+                                try:
+                                    await page.goto(
+                                        fresh_url, wait_until="domcontentloaded", timeout=60000
+                                    )
+                                    renavigations += 1
+                                    elements_gone_at = None
+                                    render_grace_until = time.monotonic() + 30
+                                    logger.warning(
+                                        f"【{cookie_id}】滑块已消失超过 15 秒且未取得 x5sec"
+                                        f"（大概率挑战已过期），已在同一窗口加载新的滑块"
+                                        f"（第 {renavigations} 次），请尽快拖动"
+                                    )
+                                except Exception as nav_exc:
+                                    logger.warning(f"【{cookie_id}】重新加载滑块失败: {nav_exc}")
+                                    elements_gone_at = now_mono
+                            else:
+                                logger.warning(
+                                    f"【{cookie_id}】实时探测未返回新惩罚 URL"
+                                    f"（账号可能已恢复，或探测失败），稍后再试"
+                                )
+                                elements_gone_at = now_mono
                     if completed:
                         break
+                else:
+                    # 滑块还在（或新滑块已渲染）—— 重置过期计时
+                    elements_gone_at = None
             except Exception as exc:
                 logger.debug(f"【{cookie_id}】检查验证完成状态失败: {exc}")
 

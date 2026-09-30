@@ -307,3 +307,26 @@ class ChallengeMarkerStripTests(unittest.TestCase):
             )
             pos = idx + 1
         self.assertGreaterEqual(found, 2, '应有两处扫码采集点都清挑战标记')
+
+
+class ExpirySelfHealTests(unittest.TestCase):
+    """回归：挑战过期自愈与诊断日志。
+
+    2026-09-30 实测：窗口弹出 7.5 分钟后用户才拖滑块，元素消失、页面
+    看着过了，但挑战约 5 分钟就过期 —— 服务端不发通行证（无新 x5sec），
+    会话干等到超时，用户以为「拖了没反应」。
+    """
+
+    def test_wait_loop_has_self_heal_and_diagnostics(self):
+        import pathlib
+
+        src = pathlib.Path('utils/manual_captcha.py').read_text(encoding='utf-8')
+        # 过期自愈：同窗口重新加载新滑块
+        self.assertIn('已在同一窗口加载新的滑块', src)
+        self.assertIn('_fetch_live_verification_url', src)
+        self.assertIn('RENAVIGATE_LIMIT', src)
+        # 元素重新出现时必须重置过期计时（否则新滑块刚拖完就误判过期）
+        self.assertIn('elements_gone_at = None', src)
+        # 诊断：任意域 Cookie 变化 + 页面跳转都要记录
+        self.assertIn('[诊断] Cookie 新增', src)
+        self.assertIn('[诊断] 页面跳转', src)
