@@ -330,3 +330,31 @@ class ExpirySelfHealTests(unittest.TestCase):
         # 诊断：任意域 Cookie 变化 + 页面跳转都要记录
         self.assertIn('[诊断] Cookie 新增', src)
         self.assertIn('[诊断] 页面跳转', src)
+
+
+class StealthInjectionTests(unittest.TestCase):
+    """回归：人工验证浏览器必须注入反检测脚本。
+
+    2026-09-30 全链路实测：滑块能拖过、新 x5sec 也能拿到并正确落库，
+    但 Token 刷新照样 FAIL_SYS_USER_VALIDATE、验证码无限弹。对照实验：
+    用户自家 Chrome 拖出的 x5sec 能用 67 分钟，Playwright 浏览器拖出的
+    秒拒 —— 唯一差异是环境指纹（navigator.webdriver / window.__playwright
+    等自动化痕迹被 nc 环境检测命中，服务端把这次通过作废）。
+    项目里早有 XianyuSliderStealth 脚本，但只接在已停用的「自动过滑块」
+    路径上，人工验证浏览器一直是裸奔的。
+    """
+
+    def test_manual_session_injects_stealth(self):
+        import pathlib
+
+        src = pathlib.Path('utils/manual_captcha.py').read_text(encoding='utf-8')
+        idx = src.find('async def open_manual_session')
+        self.assertGreater(idx, 0)
+        body = src[idx:]
+        # 必须注入 stealth 脚本，且在 new_page 之前（init script 只对
+        # 之后创建的页面生效）
+        self.assertIn('xianyu_slider_stealth', body, '人工验证必须注入反检测脚本')
+        self.assertIn('add_init_script', body)
+        inject_at = body.find('add_init_script')
+        newpage_at = body.find('await context.new_page()')
+        self.assertLess(inject_at, newpage_at, '反检测脚本必须在 new_page 之前注入')

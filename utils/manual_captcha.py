@@ -349,6 +349,30 @@ async def open_manual_session(
             # 复用调用方窗口：profile 已由调用方持有，不要再抢锁。
             logger.info(f"【{cookie_id}】复用已打开的有头浏览器窗口进行人工验证")
 
+        # 【关键】反检测：隐藏 Playwright/自动化痕迹（navigator.webdriver、
+        # window.__playwright 等）。没有这段时，滑块能拖过（拖动行为是人），
+        # 但 nc 的环境检测会发现自动化浏览器，服务端直接把这次通过作废 ——
+        # x5sec 照发但不被 API 接受，表现为「滑块过了、凭证也存了，
+        # Token 刷新照样 FAIL_SYS_USER_VALIDATE，验证码无限弹」。
+        # 2026-09-30 全链路实测：用户自家 Chrome 拖出的凭证能用 67 分钟，
+        # Playwright 浏览器拖出的凭证秒拒，唯一差异就是环境指纹。
+        # 必须在 new_page 之前 add_init_script：只对之后创建的页面生效。
+        try:
+            from utils.xianyu_slider_stealth import XianyuSliderStealth
+
+            _stealth_inst = XianyuSliderStealth.__new__(XianyuSliderStealth)
+            _stealth_inst.pure_user_id = str(cookie_id)
+            _stealth_script = _stealth_inst._get_stealth_script(
+                _stealth_inst._get_random_browser_features()
+            )
+            await context.add_init_script(_stealth_script)
+            logger.info(
+                f"【{cookie_id}】已注入反检测脚本"
+                f"（隐藏 navigator.webdriver / Playwright 痕迹，长度 {len(_stealth_script)}）"
+            )
+        except Exception as stealth_exc:
+            logger.warning(f"【{cookie_id}】反检测脚本注入失败: {stealth_exc}")
+
         if cookies_str:
             await context.add_cookies(_to_playwright_cookies(cookies_str))
 
