@@ -99,3 +99,66 @@ class SourceGuardsTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class CaptchaPopupBackoffTests(unittest.TestCase):
+    """回归：验证没完成时不能无限弹窗。
+
+    2026-09-30 实测：弹窗等 600 秒超时 → 立刻重弹，每 12 分钟一轮，
+    用户「永远关不完窗口」。必须逐次拉长间隔并在上限后停止。
+    """
+
+    def setUp(self):
+        import XianyuAutoAsync as m
+
+        self.m = m
+        m._clear_captcha_open_streak('acct')
+
+    def tearDown(self):
+        self.m._clear_captcha_open_streak('acct')
+
+    def test_backoff_escalates(self):
+        m = self.m
+        self.assertEqual(m._captcha_open_cooldown('acct'), 0.0)
+        m._note_captcha_open('acct')
+        self.assertEqual(m._captcha_open_cooldown('acct'), 20.0)
+        m._note_captcha_open('acct')
+        self.assertEqual(m._captcha_open_cooldown('acct'), 300.0)
+        m._note_captcha_open('acct')
+        self.assertEqual(m._captcha_open_cooldown('acct'), 1800.0)
+
+    def test_streak_caps_out(self):
+        m = self.m
+        for _ in range(m.CAPTCHA_AUTO_OPEN_ATTEMPTS):
+            m._note_captcha_open('acct')
+        self.assertGreaterEqual(
+            m._CAPTCHA_AUTO_OPEN_STREAK['acct'], m.CAPTCHA_AUTO_OPEN_ATTEMPTS
+        )
+
+    def test_success_clears_streak(self):
+        m = self.m
+        m._note_captcha_open('acct')
+        m._clear_captcha_open_streak('acct')
+        self.assertNotIn('acct', m._CAPTCHA_AUTO_OPEN_STREAK)
+        self.assertEqual(m._captcha_open_cooldown('acct'), 0.0)
+
+
+class PasteCookieResetsRiskTests(unittest.TestCase):
+    """回归：粘贴有效 Cookie 必须重置风控并触发重连。
+
+    2026-09-30 实测：粘贴后 Cookie 确实是好的（含 x5sec、无 x5secdata），
+    但界面依然显示风控中、浏览器窗口继续弹 —— 因为粘贴接口只保存 Cookie
+    + 重启任务，从没碰过风控状态。
+    """
+
+    def test_paste_endpoint_resets_risk_control(self):
+        import pathlib
+
+        src = pathlib.Path('app/reply_server.py').read_text(encoding='utf-8')
+        # 找到粘贴 Cookie 那段
+        idx = src.find('粘贴Cookie保存完成')
+        self.assertGreater(idx, 0)
+        window = src[max(0, idx - 4000): idx + 4000]
+        self.assertIn('guard.reset()', window, '粘贴 Cookie 后必须重置风控状态')
+        self.assertIn('request_immediate_reconnect', window, '粘贴后必须触发立即重连')
+        self.assertIn('_clear_captcha_open_streak', window, '粘贴后必须清零弹窗计数')

@@ -242,9 +242,9 @@ class AutoOpenSliderBrowserTests(unittest.IsolatedAsyncioTestCase):
             # 冷却期内再触发：不得再弹窗
             await live._auto_open_slider_browser(None)
             self.assertEqual(om.await_count, 1)
-        # 冷却过期后允许再弹
+        # 冷却过期后允许再弹（新方案是逐次拉长的阶梯冷却）
         mod._CAPTCHA_AUTO_OPEN_AT[live.cookie_id] = (
-            time.time() - mod.CAPTCHA_AUTO_OPEN_COOLDOWN - 1
+            time.time() - mod._captcha_open_cooldown(live.cookie_id) - 1
         )
         # 持有权也要归还：本用例走的是“冷却”这道门，不是“唯一持有者”那道门
         from utils import captcha_owner

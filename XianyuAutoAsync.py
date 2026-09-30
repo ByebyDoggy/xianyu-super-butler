@@ -221,7 +221,37 @@ _RECONNECT_REQUESTED_AT: dict = {}
 # 所以它根本拦不住重复弹窗：2026-09-29 15:50 实测每 8 秒弹一次，用户还没
 # 碰到滑块窗口就换了。这里用模块级时间戳做冷却，避免刷屏式弹窗。
 _CAPTCHA_AUTO_OPEN_AT: dict = {}
-CAPTCHA_AUTO_OPEN_COOLDOWN = 20.0
+
+# 每个账号连续弹窗但用户未完成验证的次数。
+#
+# 为什么需要：弹窗一次要等 600 秒，超时后又立刻重弹，形成
+# “窗口不断弹出、用户永远关不完”死循环（实测每 12 分钟一轮）。
+# 连续失败必须逐次拉长间隔，超过上限就停止自动弹窗，
+# 把恢复动作交回用户（重新登录 / 粘贴 Cookie）。
+_CAPTCHA_AUTO_OPEN_STREAK: dict = {}
+CAPTCHA_AUTO_OPEN_ATTEMPTS = 3
+# 冷却阶梯（秒）：第 1 次 20 秒，之后 5 分钟、30 分钟
+CAPTCHA_AUTO_OPEN_BACKOFF = (20.0, 300.0, 1800.0)
+
+
+def _note_captcha_open(cookie_id: str) -> None:
+    """记录一次弹窗（用于计算后续冷却间隔）。"""
+    _CAPTCHA_AUTO_OPEN_AT[cookie_id] = time.time()
+    _CAPTCHA_AUTO_OPEN_STREAK[cookie_id] = _CAPTCHA_AUTO_OPEN_STREAK.get(cookie_id, 0) + 1
+
+
+def _clear_captcha_open_streak(cookie_id: str) -> None:
+    """验证成功 / 用户手动处理后清零，下次风控可立即弹窗。"""
+    _CAPTCHA_AUTO_OPEN_STREAK.pop(cookie_id, None)
+    _CAPTCHA_AUTO_OPEN_AT.pop(cookie_id, None)
+
+
+def _captcha_open_cooldown(cookie_id: str) -> float:
+    """本次应等多少秒才能再弹窗。"""
+    streak = _CAPTCHA_AUTO_OPEN_STREAK.get(cookie_id, 0)
+    if streak <= 0:
+        return 0.0
+    return CAPTCHA_AUTO_OPEN_BACKOFF[min(streak - 1, len(CAPTCHA_AUTO_OPEN_BACKOFF) - 1)]
 
 
 def _spawn_detached(coro):
@@ -3005,15 +3035,26 @@ class XianyuLive:
             )
             return
         # 跨实例冷却：实例会随重连重建，实例级标志拦不住重复弹窗。
+        # 连续失败时逐次拉长（20s → 5min → 30min），避免“窗口不断弹出”。
+        streak = _CAPTCHA_AUTO_OPEN_STREAK.get(self.cookie_id, 0)
+        if streak >= CAPTCHA_AUTO_OPEN_ATTEMPTS:
+            logger.warning(
+                f"【{self.cookie_id}】已连续 {streak} 次弹出滑块窗口但未完成验证，"
+                f"停止自动弹窗；请手动重新登录或在「账号管理」里粘贴有效 Cookie"
+            )
+            captcha_owner.release(self.cookie_id, '后台自动弹窗')
+            return
+        cooldown = _captcha_open_cooldown(self.cookie_id)
         last_open = _CAPTCHA_AUTO_OPEN_AT.get(self.cookie_id, 0.0)
         since = time.time() - last_open
-        if since < CAPTCHA_AUTO_OPEN_COOLDOWN:
+        if last_open and since < cooldown:
             logger.info(
-                f"【{self.cookie_id}】{since:.0f} 秒前刚弹过滑块浏览器，"
-                f"{CAPTCHA_AUTO_OPEN_COOLDOWN - since:.0f} 秒内不重复弹窗"
+                f"【{self.cookie_id}】上次弹窗后仅过 {since:.0f} 秒"
+                f"（需冷却 {cooldown:.0f} 秒），跳过本次自动弹窗"
             )
+            captcha_owner.release(self.cookie_id, '后台自动弹窗')
             return
-        _CAPTCHA_AUTO_OPEN_AT[self.cookie_id] = time.time()
+        _note_captcha_open(self.cookie_id)
         self.manual_captcha_in_progress = True
         try:
             logger.warning(
@@ -3030,6 +3071,8 @@ class XianyuLive:
                 await self._apply_manual_captcha_cookies(result['cookies_str'])
                 # 清掉失效令牌，让 WS 尽快用新 Cookie 重连
                 self.current_token = None
+                # 验证成功就清零弹窗计数，下次风控可立即弹窗（不需要等冷却）
+                _clear_captcha_open_streak(self.cookie_id)
                 logger.warning(
                     f"【{self.cookie_id}】人工验证完成，新 Cookie 已生效，账号即将自动恢复"
                 )

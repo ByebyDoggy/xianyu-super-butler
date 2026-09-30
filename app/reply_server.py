@@ -3127,6 +3127,53 @@ async def login_with_pasted_cookie(
 
         account_info = await process_qr_login_cookies(line, unb, current_user)
         manager_operation = account_info.pop('_manager_operation', None)
+
+        # 粘贴 Cookie 的语义是“用户已经用另一条路把验证过了，现在把凭证交给我”。
+        # 因此必须把风控状态一并清零：原实现只保存 Cookie + 重启任务，
+        # 风控计数器（consecutive_hits）与冷却时间原样保留，于是出现
+        # “粘贴了有效 Cookie，界面依然显示处于风控、并且继续弹浏览器窗口”。
+        # 而且冷却会让账号停在那里不去重连，看起来像“粘了没用”。
+        account_id_for_risk = account_info.get('account_id') or unb
+        try:
+            from utils import risk_control
+
+            guard = risk_control.registry.get(account_id_for_risk)
+            guard.reset()
+            log_with_user(
+                'info',
+                f"已重置账号 {account_id_for_risk} 的风控状态（粘贴 Cookie 视为人工验证完成）",
+                current_user,
+            )
+        except Exception as exc:
+            log_with_user('warning', f"重置风控状态失败: {exc}", current_user)
+
+        # 清掉失效令牌并让运行中的实例立刻用新 Cookie 重连，而不是等下一轮
+        try:
+            from app.cookie_manager import manager as _cm
+
+            _manager = getattr(_cm, 'manager', None)
+            _inst = _manager.instances.get(account_id_for_risk) if _manager else None
+            if _inst is not None:
+                _inst.cookies = cookie_fields
+                _inst.cookies_str = line
+                _inst.current_token = None
+                log_with_user('info', f"账号 {account_id_for_risk} 运行实例已同步新 Cookie", current_user)
+            try:
+                from XianyuAutoAsync import (
+                    _clear_captcha_open_streak,
+                    request_immediate_reconnect,
+                )
+
+                # 用户手动贴 Cookie = 人工介入完成，清掉弹窗计数，
+                # 否则下次风控还在冷却里、窗口不会再弹
+                _clear_captcha_open_streak(str(account_id_for_risk))
+                request_immediate_reconnect(str(account_id_for_risk))
+                log_with_user('info', f"账号 {account_id_for_risk} 已触发立即重连", current_user)
+            except Exception as exc:
+                log_with_user('warning', f"触发立即重连失败: {exc}", current_user)
+        except Exception as exc:
+            log_with_user('warning', f"同步运行实例失败: {exc}", current_user)
+
         log_with_user(
             'info',
             f"粘贴Cookie保存完成: 账号={account_info.get('account_id')}, "
