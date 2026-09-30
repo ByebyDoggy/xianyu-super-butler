@@ -101,6 +101,18 @@ def strip_challenge_markers_from_dict(cookies: dict) -> list:
     return dropped
 
 
+def filter_mtop_set_cookies(new_cookies: dict) -> dict:
+    """过滤 mtop 响应 set-cookie：**x5sec 绝不让响应覆盖**。
+
+    2026-09-30 09:29 实测：滑块通过后带着新 x5sec 请求，返回
+    FAIL_SYS_TOKEN_EXOIRED（风控已通过、只是签名过期）；但该响应的
+    set-cookie 会把会话旧 x5sec 塞回来，合并后自愈重试带的是旧值
+    → 又被要求滑块 → 无限循环，且新通行证被永久丢弃。
+    x5sec 只能来自人工通过 / 用户粘贴 / 扫码采集，响应合并永远不碰它。
+    """
+    return {k: v for k, v in new_cookies.items() if str(k).lower() != 'x5sec'}
+
+
 def drop_stale_captcha_challenge(cookies_str: str) -> str:
     """拿到 x5sec 后清掉遗留的验证挑战标记，返回新的 Cookie 字符串。
 

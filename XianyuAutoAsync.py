@@ -1137,6 +1137,9 @@ class XianyuLive:
                 continue
             name, value = cookie.split(';', 1)[0].split('=', 1)
             new_cookies[name.strip()] = value.strip()
+        # x5sec 绝不让响应覆盖（会丢掉刚过滑块拿到的新通行证，见 filter_mtop_set_cookies）
+        from utils.xianyu_utils import filter_mtop_set_cookies
+        new_cookies = filter_mtop_set_cookies(new_cookies)
 
         if not new_cookies:
             return
@@ -2626,6 +2629,12 @@ class XianyuLive:
                             if '=' in cookie:
                                 name, value = cookie.split(';')[0].split('=', 1)
                                 new_cookies[name.strip()] = value.strip()
+                        # x5sec 绝不让响应覆盖：实测（2026-09-30 09:29）滑块通过后
+                        # 第 1 次请求返回「签名令牌过期」（风控已过、可自愈），
+                        # 但响应 set-cookie 把会话旧 x5sec 塞回来，合并后自愈重试
+                        # 带旧值又被拒 → 无限循环。x5sec 只能来自人工通过/粘贴/扫码。
+                        from utils.xianyu_utils import filter_mtop_set_cookies
+                        new_cookies = filter_mtop_set_cookies(new_cookies)
 
                         # 更新cookies
                         if new_cookies:
@@ -4860,6 +4869,9 @@ class XianyuLive:
                         if '=' in cookie:
                             name, value = cookie.split(';')[0].split('=', 1)
                             new_cookies[name.strip()] = value.strip()
+                    # x5sec 绝不让响应覆盖（见 filter_mtop_set_cookies 注释）
+                    from utils.xianyu_utils import filter_mtop_set_cookies
+                    new_cookies = filter_mtop_set_cookies(new_cookies)
 
                     # 更新cookies
                     if new_cookies:
@@ -12152,6 +12164,9 @@ class XianyuLive:
                         if '=' in cookie:
                             name, value = cookie.split(';')[0].split('=', 1)
                             new_cookies[name.strip()] = value.strip()
+                    # x5sec 绝不让响应覆盖（见 filter_mtop_set_cookies 注释）
+                    from utils.xianyu_utils import filter_mtop_set_cookies
+                    new_cookies = filter_mtop_set_cookies(new_cookies)
                     if new_cookies:
                         self.cookies.update(new_cookies)
                         self.cookies_str = '; '.join(f"{key}={value}" for key, value in self.cookies.items())

@@ -401,3 +401,45 @@ class LateDragFeedbackTests(unittest.TestCase):
         src = pathlib.Path('utils/manual_captcha.py').read_text(encoding='utf-8')
         # 新滑块渲染出来（元素在）时必须重置 dead_drag_at，避免误换
         self.assertRegex(src, r'else:\s*\n\s+# 滑块还在（或新滑块已渲染）—— 重置拖动状态\s*\n\s+elements_gone_at = None\s*\n\s+dead_drag_at = None')
+
+
+class X5SecMergeProtectionTests(unittest.TestCase):
+    """回归：x5sec 绝不让 mtop 响应的 set-cookie 覆盖。
+
+    2026-09-30 09:29 决定性实测：滑块通过后带着新 x5sec 请求，返回
+    FAIL_SYS_TOKEN_EXOIRED（风控已通过、只是 _m_h5_tk 签名过期，可自愈）；
+    但「签名过期」响应的 set-cookie 会把会话旧 x5sec 塞回来，合并后
+    自愈重试带的是旧值 → 又被要求滑块 → 无限循环，新通行证被永久丢弃。
+    x5sec 只能来自人工通过 / 用户粘贴 / 扫码采集。
+    """
+
+    def test_filter_drops_x5sec_only(self):
+        from utils.xianyu_utils import filter_mtop_set_cookies
+
+        out = filter_mtop_set_cookies({
+            'x5sec': 'NEW_PASS', '_m_h5_tk': 'abc_xyz', 'isg': 'v',
+            'X5SEC': 'case-insensitive', 'x5secdata': 'marker',
+        })
+        self.assertNotIn('x5sec', out)
+        self.assertNotIn('X5SEC', out)
+        self.assertEqual(out['_m_h5_tk'], 'abc_xyz')
+        self.assertEqual(out['isg'], 'v')
+        # 挑战标记由 update_config_cookies 漏斗统一丢弃，这里原样透传
+        self.assertEqual(out['x5secdata'], 'marker')
+
+    def test_all_four_merge_sites_filter_x5sec(self):
+        import pathlib
+        import re
+
+        src = pathlib.Path('XianyuAutoAsync.py').read_text(encoding='utf-8')
+        # 所有 set-cookie 解析点之后必须紧跟过滤
+        sites = [m.start() for m in re.finditer(
+            r"response\.headers\.getall\('set-cookie'", src
+        )]
+        self.assertGreaterEqual(len(sites), 4, f'应至少有 4 个合并点，实际 {len(sites)}')
+        for pos in sites:
+            window = src[pos: pos + 700]
+            self.assertIn(
+                'filter_mtop_set_cookies', window,
+                f'合并点（偏移 {pos}）解析 set-cookie 后必须过滤 x5sec',
+            )
