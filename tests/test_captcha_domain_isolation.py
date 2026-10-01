@@ -443,3 +443,32 @@ class X5SecMergeProtectionTests(unittest.TestCase):
                 'filter_mtop_set_cookies', window,
                 f'合并点（偏移 {pos}）解析 set-cookie 后必须过滤 x5sec',
             )
+
+
+class X5SecLossGuardTests(unittest.TestCase):
+    """回归：x5sec 落库后不得被无 x5sec 的回写覆盖。
+
+    2026-10-01 13:45 实测：滑块通过 → save_cookie（含新 x5sec）→ 3 秒后
+    refresh_token 响应的 set-cookie 合并触发 update_config_cookies，
+    把**无 x5sec** 的 self.cookies 整串写回库 → 通行证丢失 → 下次请求
+    18 字段/1146 长度 → 又被拒 → 无限弹窗。
+    """
+
+    def test_guard_exists_in_update_config_cookies(self):
+        import pathlib
+
+        src = pathlib.Path('XianyuAutoAsync.py').read_text(encoding='utf-8')
+        idx = src.find('async def update_config_cookies')
+        self.assertGreater(idx, 0)
+        body = src[idx: idx + 4000]
+        self.assertIn('[安全网] 拒绝覆盖', body, '落库前必须有 x5sec 防丢闸')
+        self.assertIn('库中 Cookie 含 x5sec 而本次写入不含', body)
+
+    def test_fingerprint_logging_in_apply(self):
+        import pathlib
+
+        src = pathlib.Path('XianyuAutoAsync.py').read_text(encoding='utf-8')
+        idx = src.find('async def _apply_manual_captcha_cookies')
+        self.assertGreater(idx, 0)
+        body = src[idx: idx + 3000]
+        self.assertIn('[取证] 人工验证 Cookie 指纹', body, '保存链路必须打指纹日志')

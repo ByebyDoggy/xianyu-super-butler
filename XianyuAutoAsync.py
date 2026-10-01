@@ -2981,6 +2981,20 @@ class XianyuLive:
         from utils.xianyu_utils import drop_stale_captcha_challenge
 
         cleaned = drop_stale_captcha_challenge(cookies_str)
+        # 【取证】人工验证拿回的 Cookie 在每个处理环节都要可验证：
+        # 2026-10-01 13:45 实测「检测到新 x5sec → 保存成功」，但库里最终没有
+        # x5sec（下一次请求 18 字段/1146 长度），说明中途某环节丢了。这里打指纹。
+        try:
+            from utils.xianyu_utils import trans_cookies
+            _f = trans_cookies(cleaned)
+            logger.warning(
+                f"【{self.cookie_id}】[取证] 人工验证 Cookie 指纹: "
+                f"fields={len(_f)}, len={len(cleaned)}, "
+                f"x5sec={'有(' + str(len(_f.get('x5sec', ''))) + '字符)' if _f.get('x5sec') else '无!'}, "
+                f"x5sec指纹={str(_f.get('x5sec', ''))[:18]}…"
+            )
+        except Exception as _e:
+            logger.warning(f"【{self.cookie_id}】[取证] 指纹提取失败: {_e}")
         if cleaned != cookies_str:
             logger.info(f"【{self.cookie_id}】已清除过期的验证挑战标记")
         db_manager.save_cookie(self.cookie_id, cleaned)
@@ -3548,6 +3562,38 @@ class XianyuLive:
 
             # 更新数据库中的Cookie
             if hasattr(self, 'cookie_id') and self.cookie_id:
+                # 【安全网²】落库前最后一道闸：如果库里已经有 x5sec 而本次要写
+                # 入的没有（且回忆最近一次人工验证拿到过），说明本字符串在某个
+                # 环节被丢掉了 x5sec —— 拒绝覆盖，保住刚存的通行证。
+                # 2026-10-01 13:45 实测：滑块通过 → save_cookie（含 x5sec）→
+                # 3 秒后 set-cookie 合并回写（无 x5sec 的 self.cookies）→
+                # 通行证被覆盖丢失 → 下次请求又被拒 → 无限弹窗。
+                try:
+                    _cur = db_manager.get_cookie_details(self.cookie_id) or {}
+                    _cur_str = _cur.get('cookie_value') or ''
+                    _has_x5_db = 'x5sec=' in _cur_str
+                    _has_x5_mem = 'x5sec=' in self.cookies_str
+                    if _has_x5_db and not _has_x5_mem:
+                        logger.warning(
+                            f"【{self.cookie_id}】[安全网] 拒绝覆盖："
+                            f"库中 Cookie 含 x5sec 而本次写入不含"
+                            f"（fields={len(self.cookies)}），保留库中的 x5sec"
+                        )
+                        # 只把内存里的其他字段合并进库值，不动 x5sec
+                        from utils.xianyu_utils import trans_cookies
+                        _db_cookies = trans_cookies(_cur_str)
+                        _db_cookies.update(self.cookies)
+                        _x5 = _cur_str.split('x5sec=', 1)[1].split(';', 1)[0] if 'x5sec=' in _cur_str else None
+                        if _x5:
+                            _db_cookies['x5sec'] = _x5
+                        self.cookies = _db_cookies
+                        self.cookies_str = '; '.join(
+                            f"{k}={v}" for k, v in self.cookies.items()
+                        )
+                        if getattr(self, 'session', None) and not self.session.closed:
+                            self.session.headers['cookie'] = self.cookies_str
+                except Exception as _guard_e:
+                    logger.warning(f"【{self.cookie_id}】[安全网] 检查失败（继续原逻辑）: {_guard_e}")
                 try:
                     # 获取当前Cookie的用户ID，避免在刷新时改变所有者
                     current_user_id = None
