@@ -472,3 +472,35 @@ class X5SecLossGuardTests(unittest.TestCase):
         self.assertGreater(idx, 0)
         body = src[idx: idx + 3000]
         self.assertIn('[取证] 人工验证 Cookie 指纹', body, '保存链路必须打指纹日志')
+
+
+class InstanceCookieSyncTests(unittest.TestCase):
+    """回归：运行实例同步新 Cookie 必须同时更新 cookies_str 和 cookies 字典。
+
+    2026-10-01 13:45 实测：人工验证后只同步了 instance.cookies_str，
+    而 instance.cookies（字典）仍是旧值（无 x5sec）。3 秒后 refresh_token
+    响应 set-cookie 合并：self.cookies.update(new) → 用旧字典重建
+    cookies_str → update_config_cookies 落库 —— 无 x5sec 的整串把
+    刚保存的通行证顶掉，下次请求又被拒，无限弹窗。
+    """
+
+    def test_xianyuautoasync_syncs_dict_too(self):
+        import pathlib
+
+        src = pathlib.Path('XianyuAutoAsync.py').read_text(encoding='utf-8')
+        idx = src.find('async def _apply_manual_captcha_cookies')
+        self.assertGreater(idx, 0)
+        body = src[idx: idx + 4500]
+        self.assertIn('instance.cookies_str = cleaned', body)
+        self.assertIn('instance.cookies = _tc(cleaned)', body,
+                      '必须同时同步 cookies 字典，否则下次合并从旧字典重建')
+
+    def test_reply_server_manual_session_syncs_dict_too(self):
+        import pathlib
+
+        src = pathlib.Path('app/reply_server.py').read_text(encoding='utf-8')
+        idx = src.find("instance.cookies_str = result['cookies_str']")
+        self.assertGreater(idx, 0)
+        window = src[idx: idx + 700]
+        self.assertIn("instance.cookies = _tc(result['cookies_str'])", window,
+                      '手动验证接口同样必须同步 cookies 字典')

@@ -3008,8 +3008,18 @@ class XianyuLive:
                 instance = manager.instances.get(self.cookie_id)
                 if instance is not None:
                     instance.cookies_str = cleaned
+                    # 【关键补齐】同步 cookies 字典！只改 cookies_str 不改
+                    # self.cookies，下一次 set-cookie 合并时 self.cookies.update()
+                    # 仍以旧字典为基础 —— 无 x5sec 的旧字典整串重建 cookies_str
+                    # 后落库，就把刚保存的 x5sec 顶掉了（2026-10-01 13:45 实测：
+                    # 保存成功 3 秒后 18 字段/1146 长度的无 x5sec 字符串写回库）。
+                    # 必须两处同时指向新值。
+                    from utils.xianyu_utils import trans_cookies as _tc
+                    instance.cookies = _tc(cleaned)
                     # 清掉失效令牌，强制下次请求重新获取
                     instance.current_token = None
+                    if getattr(instance, 'session', None) and not instance.session.closed:
+                        instance.session.headers['cookie'] = cleaned
                     logger.info(f"【{self.cookie_id}】运行实例已同步新 Cookie")
         except Exception as e:
             logger.warning(f"【{self.cookie_id}】同步运行实例 Cookie 失败: {self._safe_str(e)}")
