@@ -3284,6 +3284,40 @@ class DBManager:
                 cursor.execute(
                     "ALTER TABLE message_notifications ADD COLUMN notify_categories TEXT NOT NULL DEFAULT ''")
                 logger.info("message_notifications 已添加 notify_categories 列")
+            # 表曾在外部被重建过，丢失了 UNIQUE(cookie_id, channel_id) 约束
+            # （并多出 name/event_types 列）：INSERT OR REPLACE 不再去重，
+            # 每次点开关都新增一行，出现重复且互斥的绑定。重建表恢复约束。
+            cursor.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='message_notifications'")
+            row = cursor.fetchone()
+            ddl = row[0] if row else ''
+            if 'UNIQUE(cookie_id, channel_id)' not in ddl.replace(' ', '').replace('"', ''):
+                logger.warning("message_notifications 缺少 UNIQUE 约束，重建表恢复去重")
+                cursor.execute("ALTER TABLE message_notifications RENAME TO message_notifications_bak")
+                cursor.execute('''
+                CREATE TABLE message_notifications (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    cookie_id TEXT NOT NULL,
+                    channel_id INTEGER NOT NULL,
+                    enabled BOOLEAN DEFAULT TRUE,
+                    notify_categories TEXT NOT NULL DEFAULT '',
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (cookie_id) REFERENCES cookies(id) ON DELETE CASCADE,
+                    FOREIGN KEY (channel_id) REFERENCES notification_channels(id) ON DELETE CASCADE,
+                    UNIQUE(cookie_id, channel_id)
+                )
+                ''')
+                # 去重迁移：同 (cookie_id, channel_id) 只留一行（优先 enabled=1 的）
+                cursor.execute('''
+                INSERT OR IGNORE INTO message_notifications
+                    (cookie_id, channel_id, enabled, notify_categories, created_at, updated_at)
+                SELECT cookie_id, channel_id, MAX(enabled), notify_categories,
+                       MIN(created_at), MAX(updated_at)
+                FROM message_notifications_bak
+                GROUP BY cookie_id, channel_id
+                ''')
+                cursor.execute("DROP TABLE message_notifications_bak")
+                logger.info("message_notifications 已重建并恢复 UNIQUE 约束（存量重复行已去重）")
         except Exception as e:
             logger.error(f"升级 message_notifications 表失败: {e}")
             raise

@@ -636,3 +636,17 @@ class NotifyCategoryFilterTests(unittest.TestCase):
         import pathlib
         src = pathlib.Path('app/reply_server.py').read_text(encoding='utf-8')
         self.assertIn('notify_categories: str', src)
+
+
+class MessageNotificationsUniqueConstraintTests(unittest.TestCase):
+    """回归：message_notifications 表曾被外部重建丢失 UNIQUE 约束，
+    INSERT OR REPLACE 不再去重 → 每次点开关新增一行 → 前端出现多条
+    重复且互斥（一条开、多条关）的绑定。v1.9 迁移重建表恢复约束。"""
+
+    def test_migration_rebuilds_missing_unique(self):
+        import pathlib
+        src = pathlib.Path('app/db_manager.py').read_text(encoding='utf-8')
+        self.assertIn("RENAME TO message_notifications_bak", src)
+        self.assertIn('UNIQUE(cookie_id, channel_id)', src)
+        # 去重迁移保留 enabled 优先
+        self.assertIn('MAX(enabled)', src)
