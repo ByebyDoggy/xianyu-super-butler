@@ -918,6 +918,14 @@ class XianyuLive:
         self.auto_open_slider_browser = bool(
             SLIDER_VERIFICATION.get('auto_open_browser', True)
         )
+        # 验证失败/未完成后是否自动重试（再次弹窗 + 递归刷新）。
+        # 默认关：人工验证过一次没成，再自动弹窗再弹只会反复打断人 ——
+        # 用户要求一次弹窗即止，之后由人手动在「账号管理」里重新触发。
+        # 运行时实时读 system_settings.captcha_auto_retry（后台可动态改），
+        # 这里仅作为库无值时的默认。
+        self.captcha_auto_retry = bool(
+            SLIDER_VERIFICATION.get('auto_retry', False)
+        )
         self.slider_manual_timeout = 600  # 等人工过滑块的秒数（10 分钟）
         self.notification_lock = asyncio.Lock()  # 通知防重复机制的异步锁
 
@@ -3104,6 +3112,15 @@ class XianyuLive:
         """
         from utils.manual_captcha import open_manual_session
 
+        # 自动重试开关：实时读库（系统设置页可动态改），无值回落 yml 默认。
+        try:
+            from app.db_manager import db_manager
+            _v = db_manager.get_system_setting('captcha_auto_retry')
+            if _v is not None:
+                self.captcha_auto_retry = _v == 'true'
+        except Exception:
+            pass
+
         if self.manual_captcha_in_progress:
             logger.info(f"【{self.cookie_id}】人工验证已在进行，跳过重复开启")
             return
@@ -3164,9 +3181,19 @@ class XianyuLive:
                 logger.warning(
                     f"【{self.cookie_id}】人工验证未完成: {result.get('message') or '未知原因'}"
                 )
+                if not self.captcha_auto_retry:
+                    # 关闭自动重试（默认）：把 streak 记满，后续风控冷却到期后
+                    # 不再自动弹窗打断人；恢复权完全交给用户手动触发。
+                    _CAPTCHA_AUTO_OPEN_STREAK[self.cookie_id] = CAPTCHA_AUTO_OPEN_ATTEMPTS
+                    logger.info(
+                        f"【{self.cookie_id}】自动重试已关闭（SLIDER_VERIFICATION.auto_retry=false），"
+                        f"不再自动弹出验证窗口；需要时请在「账号管理」里手动触发"
+                    )
                 await self.send_token_refresh_notification(
                     f"人工滑块验证未完成：{result.get('message') or '未知原因'}\n"
-                    f"请到「账号管理」里重新触发验证，或重新扫码登录。",
+                    + ("自动重试已关闭，请到「账号管理」里手动重新触发验证，或重新扫码登录。"
+                       if not self.captcha_auto_retry else
+                       "请到「账号管理」里重新触发验证，或重新扫码登录。"),
                     "captcha_manual_required",
                     verification_url=verification_url,
                 )

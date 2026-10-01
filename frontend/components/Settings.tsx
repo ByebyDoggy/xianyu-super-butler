@@ -278,6 +278,15 @@ const Settings: React.FC = () => {
                 login_captcha_enabled: !toBool(settings.login_captcha_enabled, true),
               })}
             />
+            <SettingToggle
+              title="滑块验证自动重试"
+              description="人工验证失败/超时后自动再次弹出验证窗口。默认关闭：一次未过即停止自动弹窗，需要时在「账号管理」手动触发。"
+              checked={toBool(settings.captcha_auto_retry, false)}
+              onChange={() => setSettings({
+                ...settings,
+                captcha_auto_retry: !toBool(settings.captcha_auto_retry, false),
+              })}
+            />
           </section>
 
           <section className="section-panel">

@@ -650,3 +650,28 @@ class MessageNotificationsUniqueConstraintTests(unittest.TestCase):
         self.assertIn('UNIQUE(cookie_id, channel_id)', src)
         # 去重迁移保留 enabled 优先
         self.assertIn('MAX(enabled)', src)
+
+
+class CaptchaAutoRetrySwitchTests(unittest.TestCase):
+    """滑块验证自动重试开关：默认关，一次未过即止，不再自动弹窗。"""
+
+    def test_default_off(self):
+        import pathlib
+        src = pathlib.Path('XianyuAutoAsync.py').read_text(encoding='utf-8')
+        self.assertIn("SLIDER_VERIFICATION.get('auto_retry', False)", src)
+
+    def test_off_fills_streak_to_stop_reopening(self):
+        import pathlib
+        src = pathlib.Path('XianyuAutoAsync.py').read_text(encoding='utf-8')
+        self.assertIn('_CAPTCHA_AUTO_OPEN_STREAK[self.cookie_id] = CAPTCHA_AUTO_OPEN_ATTEMPTS', src)
+
+    def test_runtime_reads_db_setting(self):
+        import pathlib
+        src = pathlib.Path('XianyuAutoAsync.py').read_text(encoding='utf-8')
+        self.assertIn("db_manager.get_system_setting('captcha_auto_retry')", src)
+
+    def test_frontend_toggle_registered(self):
+        import pathlib
+        src = pathlib.Path('frontend/components/Settings.tsx').read_text(encoding='utf-8')
+        self.assertIn('captcha_auto_retry', src)
+        self.assertIn('滑块验证自动重试', src)

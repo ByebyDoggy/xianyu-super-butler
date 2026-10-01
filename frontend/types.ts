@@ -514,6 +514,8 @@ export interface SystemSettings {
   ai_api_key?: string;
   ai_base_url?: string;
   default_reply?: string;
+  // 滑块人工验证失败/超时后是否自动重试弹窗（默认关）
+  captcha_auto_retry?: boolean;
   registration_enabled?: boolean;
   // 注册是否必须填邮箱验证码。没配 SMTP 时关掉，否则注册会卡在收不到验证码
   email_verification_enabled?: boolean;
