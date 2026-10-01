@@ -504,3 +504,48 @@ class InstanceCookieSyncTests(unittest.TestCase):
         window = src[idx: idx + 700]
         self.assertIn("instance.cookies = _tc(result['cookies_str'])", window,
                       '手动验证接口同样必须同步 cookies 字典')
+
+
+class CookieValueKeyMismatchTests(unittest.TestCase):
+    """回归：get_cookie_details 返回的键名是 'value'，不是 'cookie_value'。
+
+    2026-10-01 22:02（日志时钟 15:02）实测决定性链条：
+      · 滑块通过 → save_cookie 存库（22 字段含 x5sec，取证指纹确认）✓
+      · 运行实例 refresh_token 开头「从数据库重新加载」分支读
+        account_info.get('cookie_value') → **永远 None** → 重载从不触发
+      · 实例拿着旧 Cookie（无 x5sec）发请求 → 又被拒
+      · 响应 set-cookie 合并（过滤 x5sec）→ update_config_cookies 落库
+        → 无 x5sec 整串覆盖库里刚存的通行证
+      · 「安全网」读库同样用 cookie_value → 永远 None → _has_x5_db=False
+        → 从不拦截
+      → 结果：每次滑块过了都被静默顶掉，无限弹窗。
+
+    修复：三处读取点都改为 value or cookie_value 兼容。
+    """
+
+    def test_get_cookie_details_returns_value_key(self):
+        """守卫：返回键名若变更，所有读取点必须同步更新。"""
+        import pathlib
+
+        src = pathlib.Path('XianyuAutoAsync.py').read_text(encoding='utf-8')
+        # 不允许再出现「只读 cookie_value」的调用（必须以 value 优先）。
+        # 注意兼容写法 `get('value') or get('cookie_value')` 是允许的。
+        import re
+        bare = [
+            m for m in re.findall(r"\.get\('cookie_value'[^)]*\)", src)
+            if 'value\') or' not in m  # 兼容写法豁免
+        ]
+        # 精确排除：兼容链里作为 fallback 出现的
+        bare = [b for b in bare if f"{b}" not in src.replace("get('value') or "+b, '')]
+        self.assertEqual(bare, [], "存在只读 'cookie_value' 的调用点（键名是 'value'）")
+
+    def test_reload_and_guard_use_value_key(self):
+        import pathlib
+
+        src = pathlib.Path('XianyuAutoAsync.py').read_text(encoding='utf-8')
+        # 重载分支（refresh_token 开头）
+        self.assertIn("account_info.get('value') or account_info.get('cookie_value')", src)
+        # 安全网（update_config_cookies）
+        self.assertIn("_cur.get('value') or _cur.get('cookie_value')", src)
+        # 密码登录刷新前的重载
+        self.assertIn("db_cookie_value = account_info.get('value')", src)

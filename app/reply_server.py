@@ -9529,18 +9529,41 @@ async def start_manual_captcha(
             manager = cookie_manager.manager
             if manager is not None:
                 manager.cookies[cookie_id] = result['cookies_str']
-                instance = manager.instances.get(cookie_id)
-                if instance is not None:
+            # 【双重查找 + 同步全部】同 XianyuAutoAsync 侧：实例可能在
+            # cookie_manager.instances，也可能在 XianyuLive._instances（任务
+            # 重启后新实例注册在类字典），只查一处会静默漏掉活实例。
+            live_instances = []
+            if manager is not None:
+                _inst = manager.instances.get(cookie_id)
+                if _inst is not None:
+                    live_instances.append(_inst)
+            try:
+                from XianyuAutoAsync import XianyuLive
+                _reg = XianyuLive._instances.get(cookie_id)
+                if _reg is not None and _reg not in live_instances:
+                    live_instances.append(_reg)
+            except Exception:
+                pass
+            for instance in live_instances:
+                try:
                     instance.cookies_str = result['cookies_str']
-                    # 【关键补齐】同步 cookies 字典（同 XianyuAutoAsync 侧的修复：
-                    # 只改 str 不改 dict，下一次合并会从旧字典重建并顶掉 x5sec）
+                    # 【关键补齐】同步 cookies 字典（只改 str 不改 dict，
+                    # 下一次合并会从旧字典重建并顶掉 x5sec）
                     from utils.xianyu_utils import trans_cookies as _tc
                     instance.cookies = _tc(result['cookies_str'])
                     # 清掉失效令牌，强制下次请求重新获取
                     instance.current_token = None
                     if getattr(instance, 'session', None) and not instance.session.closed:
                         instance.session.headers['cookie'] = result['cookies_str']
-                    log_with_user('info', f"账号 {cookie_id} 运行实例已同步新 Cookie", current_user)
+                except Exception as _ie:
+                    log_with_user('warning', f"同步单个实例失败: {_ie}", current_user)
+            if live_instances:
+                log_with_user(
+                    'info',
+                    f"账号 {cookie_id} 运行实例已同步新 Cookie"
+                    f"（{len(live_instances)} 个实例）",
+                    current_user,
+                )
         except Exception as exc:
             log_with_user('warning', f"同步实例 Cookie 失败: {exc}", current_user)
 

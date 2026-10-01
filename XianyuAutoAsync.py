@@ -2508,8 +2508,12 @@ class XianyuLive:
                 account_info = await asyncio.to_thread(
                     db_manager.get_cookie_details, self.cookie_id
                 )
-                if account_info and account_info.get('cookie_value'):
-                    new_cookies_str = account_info.get('cookie_value')
+                if account_info and (account_info.get('value') or account_info.get('cookie_value')):
+                    # 兼容两种键名：get_cookie_details 返回 'value'（历史原因），
+                    # 这里曾经只读 'cookie_value' → 永远为 None → 重载分支
+                    # 从未生效过 —— 2026-10-01 15:02 实测：滑块通过存库后，
+                    # 运行实例从不重载新 Cookie，拿着旧值打接口被拒，无限弹窗。
+                    new_cookies_str = account_info.get('value') or account_info.get('cookie_value')
                     if new_cookies_str != self.cookies_str:
                         logger.info(f"【{self.cookie_id}】检测到数据库中的cookie已更新，重新加载cookie")
                         self.cookies_str = new_cookies_str
@@ -3002,25 +3006,57 @@ class XianyuLive:
         # 运行中的实例仍持有旧 Cookie，不同步会继续用旧值打接口并立刻再次熔断
         try:
             from app.cookie_manager import manager as cookie_manager
-            manager = getattr(cookie_manager, 'manager', None)
-            if manager is not None:
-                manager.cookies[self.cookie_id] = cleaned
-                instance = manager.instances.get(self.cookie_id)
-                if instance is not None:
+            _cm = getattr(cookie_manager, 'manager', None)
+            if _cm is not None:
+                _cm.cookies[self.cookie_id] = cleaned
+            # 【双重查找】2026-10-01 15:02 实测：这里只查 cookie_manager.instances，
+            # 但验证任务是脱钩任务、常跑在旧实例上；账号任务重启后新实例在
+            # XianyuLive._instances 里注册而 cookie_manager.instances 可能滞后
+            # /为空 → instance is None → 静默跳过 → 新实例永远拿不到 x5sec，
+            # 下一请求 21 字段无 x5sec 被拒 → 无限弹窗。两个注册表都查，
+            # 还要同步**所有**存活实例（不止第一个）。
+            live_instances = []
+            if _cm is not None:
+                _inst = _cm.instances.get(self.cookie_id)
+                if _inst is not None:
+                    live_instances.append(_inst)
+            try:
+                # 类级注册表：_register_instance 写这里，一定是最新活实例
+                _reg = XianyuLive._instances.get(self.cookie_id)
+                if _reg is not None and _reg not in live_instances:
+                    live_instances.append(_reg)
+            except Exception:
+                pass
+            # self 本身也可能就是活实例
+            if self not in live_instances:
+                live_instances.append(self)
+            for instance in live_instances:
+                try:
                     instance.cookies_str = cleaned
                     # 【关键补齐】同步 cookies 字典！只改 cookies_str 不改
                     # self.cookies，下一次 set-cookie 合并时 self.cookies.update()
                     # 仍以旧字典为基础 —— 无 x5sec 的旧字典整串重建 cookies_str
                     # 后落库，就把刚保存的 x5sec 顶掉了（2026-10-01 13:45 实测：
                     # 保存成功 3 秒后 18 字段/1146 长度的无 x5sec 字符串写回库）。
-                    # 必须两处同时指向新值。
                     from utils.xianyu_utils import trans_cookies as _tc
                     instance.cookies = _tc(cleaned)
                     # 清掉失效令牌，强制下次请求重新获取
                     instance.current_token = None
                     if getattr(instance, 'session', None) and not instance.session.closed:
                         instance.session.headers['cookie'] = cleaned
-                    logger.info(f"【{self.cookie_id}】运行实例已同步新 Cookie")
+                    logger.info(
+                        f"【{self.cookie_id}】运行实例已同步新 Cookie"
+                        f"（同步 {len(live_instances)} 个实例，含 x5sec）"
+                    )
+                except Exception as _ie:
+                    logger.warning(
+                        f"【{self.cookie_id}】同步单个实例失败: {self._safe_str(_ie)}"
+                    )
+            if not live_instances:
+                logger.warning(
+                    f"【{self.cookie_id}】未找到任何运行实例，新 Cookie 仅存库"
+                    f"（实例重启后将从数据库加载）"
+                )
         except Exception as e:
             logger.warning(f"【{self.cookie_id}】同步运行实例 Cookie 失败: {self._safe_str(e)}")
 
@@ -3580,7 +3616,8 @@ class XianyuLive:
                 # 通行证被覆盖丢失 → 下次请求又被拒 → 无限弹窗。
                 try:
                     _cur = db_manager.get_cookie_details(self.cookie_id) or {}
-                    _cur_str = _cur.get('cookie_value') or ''
+                    # 键名是 'value'（历史原因）；只读 'cookie_value' 永远拿不到
+                    _cur_str = _cur.get('value') or _cur.get('cookie_value') or ''
                     _has_x5_db = 'x5sec=' in _cur_str
                     _has_x5_mem = 'x5sec=' in self.cookies_str
                     if _has_x5_db and not _has_x5_mem:
@@ -3673,7 +3710,7 @@ class XianyuLive:
             
             # 【重要】先检查数据库中的cookie是否已经更新
             # 如果用户已经手动更新了cookie，就不需要触发密码登录刷新
-            db_cookie_value = account_info.get('cookie_value', '')
+            db_cookie_value = account_info.get('value') or account_info.get('cookie_value') or ''
             if db_cookie_value and db_cookie_value != self.cookies_str:
                 logger.info(f"【{self.cookie_id}】检测到数据库中的cookie已更新，重新加载cookie")
                 self.cookies_str = db_cookie_value
