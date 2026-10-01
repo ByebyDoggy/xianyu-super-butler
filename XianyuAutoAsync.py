@@ -5569,11 +5569,20 @@ class XianyuLive:
 
         return sent
 
-    async def send_notification(self, send_user_name: str, send_user_id: str, send_message: str, item_id: str = None, chat_id: str = None):
-        """发送消息通知"""
+    async def send_notification(self, send_user_name: str, send_user_id: str, send_message: str, item_id: str = None, chat_id: str = None, category="user_message"):
+        """发送消息通知
+
+        Args:
+            category: 通知类别（utils/notification_category.py）。
+                买家消息传 "user_message"（默认）；系统事件传对应类别，
+                通知标题会带图标区分（💬 买家消息 / ⚠️ 风控 / 🔑 异常）。
+        """
         try:
             from app.db_manager import db_manager
+            from utils.notification_category import format_header, normalize_category
             import hashlib
+
+            cat = normalize_category(category)
 
             # 过滤系统默认消息，不发送通知
             system_messages = [
@@ -5587,7 +5596,8 @@ class XianyuLive:
 
             # 生成通知的唯一标识（基于消息内容、chat_id、send_user_id）
             # 用于防重复发送
-            notification_key = f"{chat_id or 'unknown'}_{send_user_id}_{send_message}"
+            # 防重复 key 加入类别，避免同内容不同类别互相吞
+            notification_key = f"{cat.value}_{chat_id or 'unknown'}_{send_user_id}_{send_message}"
             notification_hash = hashlib.md5(notification_key.encode('utf-8')).hexdigest()
             
             # 使用异步锁保护防重复检查，确保并发安全
@@ -5623,8 +5633,8 @@ class XianyuLive:
 
             logger.info(f"📱 找到 {len(notifications)} 个通知渠道配置")
 
-            # 构建通知消息
-            notification_msg = f"🚨 接收消息通知\n\n" \
+            # 构建通知消息（首行带类别图标，一眼区分买家消息/系统事件）
+            notification_msg = f"{format_header(cat)}\n\n" \
                              f"账号: {self.cookie_id}\n" \
                              f"买家: {send_user_name} (ID: {send_user_id})\n" \
                              f"商品ID: {item_id or '未知'}\n" \
@@ -6228,6 +6238,12 @@ class XianyuLive:
             attachment_path: 附件路径（可选，用于发送截图）
         """
         try:
+            from utils.notification_category import category_from_notification_type, format_header
+
+            # 类别由 notification_type 推断（captcha_* → 风控、token_/cookie_* → 异常、
+            # *_success → 状态变更、notification_test → 测试）
+            cat = category_from_notification_type(notification_type)
+
             # 检查是否是正常的令牌过期，这种情况不需要发送通知
             if self._is_normal_token_expiry(error_message):
                 logger.warning(f"检测到正常的令牌过期，跳过通知: {error_message}")
@@ -6275,20 +6291,21 @@ class XianyuLive:
                 logger.warning("未配置消息通知，跳过Token刷新通知")
                 return
 
-            # 构造通知消息
+            # 构造通知消息（首行带类别图标：⚠️ 风控验证 / 🔑 账号异常 / ✅ 状态）
+            header = format_header(cat)
             # 判断异常信息中是否包含"滑块验证成功"
             if "滑块验证成功" in error_message:
-                notification_msg = f"{error_message}\n\n" \
+                notification_msg = f"{header}\n\n{error_message}\n\n" \
                                   f"账号: {self.cookie_id}\n" \
                                   f"时间: {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
             elif verification_url:
                 # 如果有验证链接，添加到消息中
-                notification_msg = f"{error_message}\n\n" \
+                notification_msg = f"{header}\n\n{error_message}\n\n" \
                                   f"账号: {self.cookie_id}\n" \
                                   f"时间: {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n" \
                                   f"验证链接: {verification_url}\n"
             else:
-                notification_msg = f"Token刷新异常\n\n" \
+                notification_msg = f"{header}\n\n" \
                                   f"账号ID: {self.cookie_id}\n" \
                                   f"异常时间: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())}\n" \
                                   f"异常信息: {error_message}\n\n" \

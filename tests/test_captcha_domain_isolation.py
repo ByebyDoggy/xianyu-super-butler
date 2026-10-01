@@ -549,3 +549,61 @@ class CookieValueKeyMismatchTests(unittest.TestCase):
         self.assertIn("_cur.get('value') or _cur.get('cookie_value')", src)
         # 密码登录刷新前的重载
         self.assertIn("db_cookie_value = account_info.get('value')", src)
+
+
+class NotificationCategoryTests(unittest.TestCase):
+    """通知类别区分：买家消息 vs 系统事件（风控/Token 异常）。
+
+    2026-10-01 需求：用户希望收到通知时不用点开就能分辨是「买家来消息」
+    还是「系统触发了风控弹验证码」这类事件。
+    """
+
+    def test_buyer_message_category(self):
+        from utils.notification_category import (
+            NotificationCategory, format_header, normalize_category)
+        self.assertIs(normalize_category('user_message'), NotificationCategory.USER_MESSAGE)
+        self.assertEqual(format_header('user_message'), '💬 买家消息通知')
+
+    def test_risk_captcha_types_map_to_risk(self):
+        from utils.notification_category import category_from_notification_type as m
+        self.assertEqual(m('captcha_manual_required').value, 'risk_captcha')
+        self.assertEqual(m('captcha_max_retries_exceeded').value, 'risk_captcha')
+        self.assertEqual(m('face_verification').value, 'risk_captcha')
+
+    def test_success_types_map_to_status(self):
+        from utils.notification_category import category_from_notification_type as m
+        self.assertEqual(m('captcha_success_auto_update').value, 'account_status')
+
+    def test_token_error_types(self):
+        from utils.notification_category import category_from_notification_type as m
+        for nt in ('token_refresh', 'token_refresh_exception', 'need_relogin',
+                   'cookie_update_failed', 'db_update_failed',
+                   'instance_restart_failed'):
+            self.assertEqual(m(nt).value, 'token_error', nt)
+
+    def test_test_notification(self):
+        from utils.notification_category import category_from_notification_type as m
+        self.assertEqual(m('notification_test').value, 'test')
+
+    def test_unknown_falls_back_safely(self):
+        from utils.notification_category import normalize_category as n
+        self.assertEqual(n('whatever_unknown').value, 'user_message')
+        self.assertEqual(n(None).value, 'user_message')
+        self.assertEqual(n(123).value, 'user_message')
+
+    def test_send_notification_headers_distinct(self):
+        """买家的和风控的通知首行必须不同且带各自图标。"""
+        from utils.notification_category import format_header
+        buyer = format_header('user_message')
+        risk = format_header('risk_captcha')
+        self.assertNotEqual(buyer, risk)
+        self.assertIn('买家', buyer)
+        self.assertIn('风控', risk)
+
+    def test_source_wired(self):
+        """send_notification / send_token_refresh_notification 必须接入类别。"""
+        import pathlib
+        src = pathlib.Path('XianyuAutoAsync.py').read_text(encoding='utf-8')
+        self.assertIn('format_header(cat)', src)
+        self.assertIn('category_from_notification_type', src)
+        self.assertIn('category="user_message"', src)  # 买家消息调用点带显式类别
