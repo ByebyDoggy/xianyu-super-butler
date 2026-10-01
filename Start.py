@@ -756,6 +756,15 @@ def load_keywords_file(path: str):
 
 
 async def main():
+    # new-api 对账上报初始化（配置在 global_config.yml 的 NEW_API_REPORT 段）。
+    try:
+        from app.config import NEW_API_REPORT_CONFIG
+        from app.newapi_report import configure, start_flush_worker
+        configure(str(NEW_API_REPORT_CONFIG.get('base_url', '')), str(NEW_API_REPORT_CONFIG.get('token', '')))
+        if NEW_API_REPORT_CONFIG.get('base_url') and NEW_API_REPORT_CONFIG.get('token'):
+            start_flush_worker(int(NEW_API_REPORT_CONFIG.get('flush_interval', 300)))
+    except Exception as e:
+        logger.warning(f"new-api 上报初始化失败（忽略）: {e}")
     print("开始启动主程序...")
 
     # 初始化文件日志收集器

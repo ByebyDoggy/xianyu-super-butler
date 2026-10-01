@@ -7075,6 +7075,18 @@ class XianyuLive:
                     else:
                         db_manager.increment_delivery_times(rule['id'])
                     logger.info(f"自动发货成功: 规则ID={rule['id']}, 内容长度={len(final_content)}")
+                    # new-api 对账上报（订单→卡密）。失败入队，不阻塞发货。
+                    try:
+                        from app.newapi_report import report_shipment
+                        report_shipment(
+                            order_id=order_id,
+                            buyer_id=send_user_id,
+                            item_id=item_id,
+                            amount=(order_detail or {}).get("order_amount", ""),
+                            delivery_content=delivery_content,
+                        )
+                    except Exception as _report_e:
+                        logger.warning(f"[new-api上报] 异常（忽略）: {self._safe_str(_report_e)}")
                     return final_content
                 else:
                     logger.warning(f"获取发货内容失败: 规则ID={rule['id']}")

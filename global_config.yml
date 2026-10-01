@@ -117,3 +117,10 @@ WEBSOCKET_HEADERS:
   User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML,
     like Gecko) Chrome/133.0.0.0 Safari/537.36
 WEBSOCKET_URL: wss://wss-goofish.dingtalk.com/
+
+# 闲鱼发货 → new-api 对账上报（补偿/退货依赖此数据）
+# token: new-api 系统访问令牌（RootAuth）
+NEW_API_REPORT:
+  base_url: ""      # 例: https://ai.lesec.top
+  token: ""         # 留空则不上报
+  flush_interval: 300

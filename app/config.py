@@ -131,6 +131,8 @@ def browser_headless() -> bool:
     if env is not None:
         return env.strip().lower() in ('1', 'true', 'yes', 'on')
     return bool(BROWSER.get('headless', False))
+# 闲鱼发货 → new-api 对账上报配置
+NEW_API_REPORT_CONFIG = config.get('NEW_API_REPORT', {})
 API_ENDPOINTS = config.get('API_ENDPOINTS', {})
 DEFAULT_HEADERS = config.get('DEFAULT_HEADERS', {})
 WEBSOCKET_HEADERS = config.get('WEBSOCKET_HEADERS', {})
