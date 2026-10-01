@@ -96,7 +96,7 @@ RECONNECT:
   # 为什么要调大：风控期间每 60 秒重连一次 = 对已经被限流的账号持续加压，
   # 平台会据此不断续期封控（RGV587「哎哟喂,被挤爆啦」就是这个意思），结果永远出不来。
   # 3600 = 1 小时一次。风控冷却期比这个长时会自动沿用冷却剩余时间。
-  interval: 3600
+  interval: 600
 BROWSER_LOGIN:
   # 本地有头浏览器登录：会弹出一个真实浏览器窗口，你在窗口里完成
   # 扫码 / 账号密码 / 滑块 / 人脸验证，登录成功后系统自动回收 Cookie。
@@ -105,7 +105,7 @@ BROWSER_LOGIN:
   # 登录入口：/im 会强制跳登录，登录成功正好停在消息页。
   url: https://www.goofish.com/im
   # 等你在窗口里操作的秒数上限
-  timeout: 300
+  timeout: 3600
 WEBSOCKET_HEADERS:
   Accept-Encoding: gzip, deflate, br, zstd
   Accept-Language: zh-CN,zh;q=0.9
@@ -121,6 +121,6 @@ WEBSOCKET_URL: wss://wss-goofish.dingtalk.com/
 # 闲鱼发货 → new-api 对账上报（补偿/退货依赖此数据）
 # token: new-api 系统访问令牌（RootAuth）
 NEW_API_REPORT:
-  base_url: ""      # 例: https://ai.lesec.top
+  base_url: "https://ai.lesec.top"      # 例: https://ai.lesec.top
   token: ""         # 留空则不上报
   flush_interval: 300
