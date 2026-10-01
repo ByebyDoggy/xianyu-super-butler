@@ -5633,6 +5633,16 @@ class XianyuLive:
 
             logger.info(f"📱 找到 {len(notifications)} 个通知渠道配置")
 
+            # 按类别过滤：绑定上未勾选的类别不推（空 = 全部都推）
+            notifications = [
+                n for n in notifications
+                if not (n.get('notify_categories') or '').strip()
+                or cat.value in (x.strip() for x in n['notify_categories'].split(','))
+            ]
+            if not notifications:
+                logger.info(f"📱 本类别 {cat.value} 未勾选任何渠道，跳过通知")
+                return
+
             # 构建通知消息（首行带类别图标，一眼区分买家消息/系统事件）
             notification_msg = f"{format_header(cat)}\n\n" \
                              f"账号: {self.cookie_id}\n" \
@@ -6287,8 +6297,15 @@ class XianyuLive:
             # 获取当前账号的通知配置
             notifications = db_manager.get_account_notifications(self.cookie_id)
 
+            # 按类别过滤（空 = 全部都推）
+            notifications = [
+                n for n in notifications
+                if not (n.get('notify_categories') or '').strip()
+                or cat.value in (x.strip() for x in n['notify_categories'].split(','))
+            ]
+
             if not notifications:
-                logger.warning("未配置消息通知，跳过Token刷新通知")
+                logger.info(f"本类别 {cat.value} 未勾选任何渠道，跳过Token刷新通知")
                 return
 
             # 构造通知消息（首行带类别图标：⚠️ 风控验证 / 🔑 账号异常 / ✅ 状态）

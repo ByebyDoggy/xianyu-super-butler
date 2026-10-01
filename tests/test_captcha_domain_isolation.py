@@ -607,3 +607,32 @@ class NotificationCategoryTests(unittest.TestCase):
         self.assertIn('format_header(cat)', src)
         self.assertIn('category_from_notification_type', src)
         self.assertIn('category="user_message"', src)  # 买家消息调用点带显式类别
+
+
+class NotifyCategoryFilterTests(unittest.TestCase):
+    """账号通知绑定按类别过滤：用户要求只收系统告警、不推买家消息。"""
+
+    def test_filter_logic(self):
+        # 空 = 全部都推；非空 = 只推列出的类别
+        def keep(n, cat):
+            s = (n.get('notify_categories') or '').strip()
+            return not s or cat in (x.strip() for x in s.split(','))
+        only_risk = {'notify_categories': 'risk_captcha,token_error'}
+        all_cats = {'notify_categories': ''}
+        legacy = {}  # 老数据无该字段
+        self.assertTrue(keep(only_risk, 'risk_captcha'))
+        self.assertFalse(keep(only_risk, 'user_message'))  # 买家消息被滤掉 ✓
+        self.assertTrue(keep(all_cats, 'user_message'))
+        self.assertTrue(keep(legacy, 'user_message'))  # 兼容旧绑定
+
+    def test_db_migration_registered(self):
+        import pathlib
+        src = pathlib.Path('app/db_manager.py').read_text(encoding='utf-8')
+        self.assertIn('upgrade_message_notifications_categories', src)
+        self.assertIn('"1.9"', src)
+        self.assertIn('notify_categories', src)
+
+    def test_api_accepts_categories(self):
+        import pathlib
+        src = pathlib.Path('app/reply_server.py').read_text(encoding='utf-8')
+        self.assertIn('notify_categories: str', src)

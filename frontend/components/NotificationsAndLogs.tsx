@@ -18,6 +18,7 @@ import {
 import {
   AccountDetail,
   MessageNotification,
+  NOTIFICATION_CATEGORY_OPTIONS,
   NotificationChannel,
   NotificationChannelType,
   RiskControlLog,
@@ -287,10 +288,29 @@ const NotificationsAndLogs: React.FC<NotificationsAndLogsProps> = ({ isAdmin }) 
 
   const toggleBinding = async (binding: MessageNotification) => {
     try {
-      await setMessageNotification(binding.cookie_id, binding.channel_id, !binding.enabled);
+      await setMessageNotification(binding.cookie_id, binding.channel_id, !binding.enabled, binding.notify_categories || '');
       await loadBaseData();
     } catch (error) {
       notify(`更新绑定失败：${(error as Error).message}`);
+    }
+  };
+
+  const toggleBindingCategory = async (binding: MessageNotification, categoryValue: string) => {
+    // 勾选/去勾选类别；全部勾选等同清空（全部都推）
+    const current = (binding.notify_categories || '').split(',').map((s) => s.trim()).filter(Boolean);
+    let next: string[];
+    if (current.includes(categoryValue)) {
+      next = current.filter((c) => c !== categoryValue);
+    } else {
+      next = [...current, categoryValue];
+    }
+    const all = NOTIFICATION_CATEGORY_OPTIONS.every((o) => next.includes(o.value));
+    const stored = all ? '' : next.join(',');
+    try {
+      await setMessageNotification(binding.cookie_id, binding.channel_id, binding.enabled, stored);
+      await loadBaseData();
+    } catch (error) {
+      notify(`更新通知类别失败：${(error as Error).message}`);
     }
   };
 
@@ -520,6 +540,29 @@ const NotificationsAndLogs: React.FC<NotificationsAndLogsProps> = ({ isAdmin }) 
                     <p className="mt-1 text-xs text-gray-500">
                       {binding.channel_name} · {binding.enabled ? '接收通知' : '暂停通知'}
                     </p>
+                    {binding.enabled && (
+                      <div className="mt-2 flex flex-wrap gap-1.5">
+                        {NOTIFICATION_CATEGORY_OPTIONS.map((opt) => {
+                          const cats = (binding.notify_categories || '').split(',').map((s) => s.trim()).filter(Boolean);
+                          const checked = cats.length === 0 || cats.includes(opt.value);
+                          return (
+                            <button
+                              key={opt.value}
+                              type="button"
+                              onClick={() => void toggleBindingCategory(binding, opt.value)}
+                              title={checked ? '点击取消该类别' : '点击接收该类别'}
+                              className={`rounded-full border px-2.5 py-0.5 text-xs transition-colors ${
+                                checked
+                                  ? 'border-[#ffe100] bg-[#fffbe0] text-gray-900'
+                                  : 'border-gray-200 bg-white text-gray-400'
+                              }`}
+                            >
+                              {opt.label}
+                            </button>
+                          );
+                        })}
+                      </div>
+                    )}
                   </div>
                   <button
                     type="button"

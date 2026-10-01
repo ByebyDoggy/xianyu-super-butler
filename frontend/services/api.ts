@@ -1001,8 +1001,8 @@ export const getMessageNotifications = async (): Promise<{ success: boolean; dat
   return { success: true, data: notifications };
 }
 
-export const setMessageNotification = async (cookieId: string, channelId: number, enabled: boolean): Promise<ApiResponse> => {
-  return post(`/message-notifications/${cookieId}`, { channel_id: channelId, enabled });
+export const setMessageNotification = async (cookieId: string, channelId: number, enabled: boolean, notifyCategories = ''): Promise<ApiResponse> => {
+  return post(`/message-notifications/${cookieId}`, { channel_id: channelId, enabled, notify_categories: notifyCategories });
 }
 
 export const deleteMessageNotification = async (notificationId: string): Promise<ApiResponse> => {

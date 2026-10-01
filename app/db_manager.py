@@ -682,6 +682,7 @@ class DBManager:
                 cookie_id TEXT NOT NULL,
                 channel_id INTEGER NOT NULL,
                 enabled BOOLEAN DEFAULT TRUE,
+                notify_categories TEXT NOT NULL DEFAULT '',
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (cookie_id) REFERENCES cookies(id) ON DELETE CASCADE,
@@ -1049,6 +1050,13 @@ class DBManager:
                 self.upgrade_notification_channels_drop_type_check(cursor)
                 self.set_system_setting("db_version", "1.8", "数据库版本号")
                 logger.info("数据库升级到版本1.8完成")
+
+            # 升级到版本1.9 - 账号通知绑定支持按类别过滤（买家消息/风控/异常）
+            if current_version < "1.9":
+                logger.info("开始升级数据库到版本1.9...")
+                self.upgrade_message_notifications_categories(cursor)
+                self.set_system_setting("db_version", "1.9", "数据库版本号")
+                logger.info("数据库升级到版本1.9完成")
 
             # 迁移遗留数据（在所有版本升级完成后执行）
             self.migrate_legacy_data(cursor)
@@ -3241,22 +3249,44 @@ class DBManager:
                 return False
 
     # -------------------- 消息通知配置操作 --------------------
-    def set_message_notification(self, cookie_id: str, channel_id: int, enabled: bool = True) -> bool:
-        """设置账号的消息通知"""
+    def set_message_notification(self, cookie_id: str, channel_id: int, enabled: bool = True, notify_categories: str = '') -> bool:
+        """设置账号的消息通知
+
+        Args:
+            notify_categories: 逗号分隔的通知类别（user_message/risk_captcha/
+                token_error/account_status/test）。空串 = 全部类别都推。
+        """
         with self.lock:
             try:
                 cursor = self.conn.cursor()
                 cursor.execute('''
-                INSERT OR REPLACE INTO message_notifications (cookie_id, channel_id, enabled)
-                VALUES (?, ?, ?)
-                ''', (cookie_id, channel_id, enabled))
+                INSERT OR REPLACE INTO message_notifications (cookie_id, channel_id, enabled, notify_categories)
+                VALUES (?, ?, ?, ?)
+                ''', (cookie_id, channel_id, enabled, notify_categories or ''))
                 self.conn.commit()
-                logger.debug(f"设置消息通知: {cookie_id} -> {channel_id}")
+                logger.debug(f"设置消息通知: {cookie_id} -> {channel_id} (categories={notify_categories or '全部'})")
                 return True
             except Exception as e:
                 logger.error(f"设置消息通知失败: {e}")
                 self.conn.rollback()
                 return False
+
+    def upgrade_message_notifications_categories(self, cursor):
+        """v1.9：message_notifications 加 notify_categories 列。
+
+        空串 = 全部类别都推（老绑定行为完全不变）；
+        非空 = 只推列出的类别（如只要风控/异常告警，不推买家消息）。
+        """
+        try:
+            cursor.execute("PRAGMA table_info(message_notifications)")
+            cols = {row[1] for row in cursor.fetchall()}
+            if 'notify_categories' not in cols:
+                cursor.execute(
+                    "ALTER TABLE message_notifications ADD COLUMN notify_categories TEXT NOT NULL DEFAULT ''")
+                logger.info("message_notifications 已添加 notify_categories 列")
+        except Exception as e:
+            logger.error(f"升级 message_notifications 表失败: {e}")
+            raise
 
     def get_account_notifications(self, cookie_id: str, user_id: int = None) -> List[Dict[str, any]]:
         """获取账号的通知配置"""
@@ -3264,7 +3294,7 @@ class DBManager:
             try:
                 cursor = self.conn.cursor()
                 sql = '''
-                SELECT mn.id, mn.channel_id, mn.enabled, nc.name, nc.type, nc.config
+                SELECT mn.id, mn.channel_id, mn.enabled, mn.notify_categories, nc.name, nc.type, nc.config
                 FROM message_notifications mn
                 JOIN notification_channels nc ON mn.channel_id = nc.id
                 JOIN cookies c ON mn.cookie_id = c.id
@@ -3285,9 +3315,10 @@ class DBManager:
                         'id': row[0],
                         'channel_id': row[1],
                         'enabled': bool(row[2]),
-                        'channel_name': row[3],
-                        'channel_type': row[4],
-                        'channel_config': row[5]
+                        'notify_categories': row[3] or '',
+                        'channel_name': row[4],
+                        'channel_type': row[5],
+                        'channel_config': row[6]
                     })
 
                 return notifications
@@ -3301,7 +3332,7 @@ class DBManager:
             try:
                 cursor = self.conn.cursor()
                 sql = '''
-                SELECT mn.cookie_id, mn.id, mn.channel_id, mn.enabled, nc.name, nc.type, nc.config
+                SELECT mn.cookie_id, mn.id, mn.channel_id, mn.enabled, mn.notify_categories, nc.name, nc.type, nc.config
                 FROM message_notifications mn
                 JOIN notification_channels nc ON mn.channel_id = nc.id
                 JOIN cookies c ON mn.cookie_id = c.id
@@ -3326,9 +3357,10 @@ class DBManager:
                         'id': row[1],
                         'channel_id': row[2],
                         'enabled': bool(row[3]),
-                        'channel_name': row[4],
-                        'channel_type': row[5],
-                        'channel_config': row[6]
+                        'notify_categories': row[4] or '',
+                        'channel_name': row[5],
+                        'channel_type': row[6],
+                        'channel_config': row[7]
                     })
 
                 return result

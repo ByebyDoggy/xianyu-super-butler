@@ -361,7 +361,17 @@ export interface MessageNotification {
   channel_name: string;
   channel_type?: NotificationChannelType;
   enabled: boolean;
+  notify_categories?: string;
 }
+
+// 通知类别（与后端 utils/notification_category.py 对齐）
+export const NOTIFICATION_CATEGORY_OPTIONS = [
+  { value: 'user_message', label: '💬 买家消息' },
+  { value: 'risk_captcha', label: '⚠️ 风控验证' },
+  { value: 'token_error', label: '🔑 账号异常' },
+  { value: 'account_status', label: '✅ 账号状态' },
+  { value: 'test', label: '🧪 测试' },
+] as const;
 
 export interface RiskControlLog {
   id: number;

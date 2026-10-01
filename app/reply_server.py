@@ -1628,6 +1628,7 @@ class NotificationChannelUpdate(BaseModel):
 class MessageNotificationIn(BaseModel):
     channel_id: int
     enabled: bool = True
+    notify_categories: str = ''  # 逗号分隔类别；空 = 全部都推
 
 
 class MessageFilterIn(BaseModel):
@@ -3921,7 +3922,7 @@ def set_message_notification(cid: str, notification_data: MessageNotificationIn,
         if not channel:
             raise HTTPException(status_code=404, detail='通知渠道不存在')
 
-        success = db_manager.set_message_notification(cid, notification_data.channel_id, notification_data.enabled)
+        success = db_manager.set_message_notification(cid, notification_data.channel_id, notification_data.enabled, notification_data.notify_categories)
         if success:
             return {'msg': 'message notification set'}
         else:
