@@ -3321,6 +3321,7 @@ async def browser_login_with_local_browser(
     if info.get('keep_open'):
         kept_context = info.get('context')
         kept_page = info.get('page')
+        kept_playwright = info.get('playwright')
 
         async def _manual_then_close():
             from utils import captcha_owner
@@ -3410,6 +3411,17 @@ async def browser_login_with_local_browser(
                             await kept_page.close()
                         except Exception:
                             pass
+                    # 归还 profile 占用 + 停 Playwright 内核。keep_open 时
+                    # open_login_session 的 finally 故意不释放（窗口还活着），
+                    # 这里窗口已关 —— 不补还的话锁永久泄漏，用户再点登录
+                    # 就会报「profile 被其他任务占用超过 20 秒」（2026-10-02 实训）。
+                    if kept_playwright is not None:
+                        try:
+                            await kept_playwright.stop()
+                        except Exception:
+                            pass
+                    from utils.browser_profile import release_profile_async
+                    await release_profile_async(None, '登录窗口验证')
                 except Exception as exc:
                     log_with_user(
                         'warning', f"关闭登录窗口失败: {exc}", current_user

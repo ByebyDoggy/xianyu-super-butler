@@ -436,6 +436,11 @@ async def open_login_session(
             result['keep_open'] = True
             result['context'] = context
             result['page'] = page
+            # keep_open 分支的 finally 不释放 profile 占用（窗口活着就需要它），
+            # 归还责任移交调用方 —— 这里必须把 playwright 引用带回，
+            # 否则调用方关窗后既停不了内核、也补还不了 profile 锁
+            # （实测：锁泄漏后用户再点登录就报「profile 被其他任务占用超过 20 秒」）。
+            result['playwright'] = playwright
             _PENDING_VERIFICATION_WINDOWS[label] = time.time()
             logger.warning(
                 f'【{label}】检测到验证码/风控，保留本窗口交给人工验证'
