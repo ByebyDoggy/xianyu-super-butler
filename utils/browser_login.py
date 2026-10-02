@@ -93,9 +93,30 @@ def _session_usable_from_token_response(payload: dict) -> bool:
     return False
 
 
+# 验证窗口登记的最长有效期（秒）。人工验证超时设的是 600 秒，窗口实际
+# 生命周期不会超过它多少；超过视为残留登记（窗口早已不存在）。
+# 背景（2026-10-02 实训）：keep_open 开窗时登记键是 '新账号'（当时还不知道
+# 哪个账号），同窗口验证结束却用 target 账号 id 清理 —— 键名错位导致
+# 登记永远不清，之后用户再点登录就一直被告知「已有一个验证码窗口打开着
+# （4350 秒前）」而他根本看不到窗口。TTL 是最后一道兜底。
+PENDING_VERIFICATION_TTL = 20 * 60
+
+
 def pending_verification_window(label: str) -> Optional[float]:
-    """返回正在等待人工验证的窗口打开时间（None = 没有）。"""
-    return _PENDING_VERIFICATION_WINDOWS.get(label)
+    """返回正在等待人工验证的窗口打开时间（None = 没有）。
+
+    登记超过 TTL 视为残留自动作废：窗口不可能还开着（验证早超时了），
+    继续挡住用户只会让人莫名其妙。
+    """
+    opened = _PENDING_VERIFICATION_WINDOWS.get(label)
+    if opened is not None and time.time() - opened > PENDING_VERIFICATION_TTL:
+        _PENDING_VERIFICATION_WINDOWS.pop(label, None)
+        logger.warning(
+            f'【{label}】验证窗口登记已存在 {int(time.time() - opened)} 秒（超过 TTL '
+            f'{PENDING_VERIFICATION_TTL} 秒），鉴定为残留登记并作废（窗口早已关闭）'
+        )
+        return None
+    return opened
 
 
 def clear_pending_verification_window(label: str) -> None:

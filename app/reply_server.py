@@ -3388,7 +3388,12 @@ async def browser_login_with_local_browser(
                 try:
                     from utils.browser_login import clear_pending_verification_window
 
+                    # 开窗时登记用的是『新账号』（当时还不知道操作哪个账号），
+                    # 而 target 是验证过程中解析出的账号 id —— 两把钥匙都得清，
+                    # 否则残留登记会一直挡住后续登录（2026-10-02 实训）。
                     clear_pending_verification_window(target or '新账号')
+                    if target:
+                        clear_pending_verification_window('新账号')
                 except Exception:
                     pass
                 try:
