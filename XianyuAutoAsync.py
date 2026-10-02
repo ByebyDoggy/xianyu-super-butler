@@ -487,6 +487,12 @@ class XianyuLive:
                 else:
                     logger.debug(f"【{self.cookie_id}】入站推送看门狗已完成，跳过")
 
+            if self._geo_guard_task:
+                if not self._geo_guard_task.done():
+                    tasks_to_cancel.append(("出口IP守卫", self._geo_guard_task))
+                else:
+                    logger.debug(f"【{self.cookie_id}】出口IP守卫已完成，跳过")
+
             if not tasks_to_cancel:
                 logger.info(f"【{self.cookie_id}】没有后台任务需要取消（所有任务已完成或不存在）")
                 # 立即重置任务引用
@@ -500,6 +506,7 @@ class XianyuLive:
                 self.delivery_timeout_task = None
                 self.buyer_interaction_task = None
                 self.inbound_watchdog_task = None
+                self._geo_guard_task = None
                 return
             
             logger.info(f"【{self.cookie_id}】开始取消 {len(tasks_to_cancel)} 个未完成的后台任务...")
@@ -640,6 +647,7 @@ class XianyuLive:
             self.delivery_timeout_task = None
             self.buyer_interaction_task = None
             self.inbound_watchdog_task = None
+            self._geo_guard_task = None
             logger.info(f"【{self.cookie_id}】后台任务引用已全部重置")
 
     # 平台风控/人机验证的特征串。命中后必须大幅退避 —— 继续高频重试只会
@@ -1043,6 +1051,9 @@ class XianyuLive:
 
         # 后台任务追踪（用于清理未等待的任务）
         self.background_tasks = set()  # 追踪所有后台任务
+
+        # 出口IP归属地守卫（境外IP会收紧闲鱼风控，启动时检一次+每30分钟复查）
+        self._geo_guard_task = None
         
         # 消息处理并发控制（防止内存泄漏）
         self.message_semaphore = asyncio.Semaphore(100)  # 最多100个并发消息处理任务
@@ -11592,6 +11603,18 @@ class XianyuLive:
         try:
             logger.info(f"【{self.cookie_id}】开始启动XianyuLive主程序...")
             await self.create_session()  # 创建session
+            # 出口IP归属地守卫：境外出口（代理/VPN）会被闲鱼风控收紧 ——
+            # 启动时先检一次，之后每 30 分钟复查，非境内立即通知。
+            try:
+                from utils.geo_guard import create_geo_guard_task
+                self._geo_guard_task = create_geo_guard_task(
+                    notify_func=lambda msg, ntype: self.send_token_refresh_notification(
+                        msg, ntype
+                    ),
+                    cookie_id=self.cookie_id,
+                )
+            except Exception as geo_e:
+                logger.warning(f"出口IP守卫启动失败（不影响主流程）: {geo_e}")
             logger.info(f"【{self.cookie_id}】Session创建完成，开始WebSocket连接循环...")
 
             while True:
