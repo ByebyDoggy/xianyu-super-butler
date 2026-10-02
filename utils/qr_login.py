@@ -369,12 +369,20 @@ class QRLoginManager:
             try:
                 res_json = resp.json()
             except ValueError:
-                logger.warning(f"登录态接口返回非JSON: {session.session_id}")
+                logger.warning(
+                    f"登录态接口返回非JSON: {session.session_id}, "
+                    f"status={resp.status_code}, body={resp.text[:200]}"
+                )
                 return False
             success = bool(res_json.get('content', {}).get('success'))
-            logger.debug(
-                f"登录态检查: {session.session_id}, success={success}, "
-                f"unb={session.unb or '缺失'}, 响应Cookie字段={sorted(resp.cookies.keys())}"
+            # 诊断日志（INFO）：验证态卡住时能看到平台到底回了什么 ——
+            # 之前只在 debug 级别记，用户刷完脸卡住时无任何线索可查。
+            _snippet = json.dumps(res_json, ensure_ascii=False)[:260]
+            logger.info(
+                f"登录态探测: {session.session_id}, success={success}, "
+                f"unb={'有' if session.unb else '无'}, "
+                f"响应Cookie={sorted(resp.cookies.keys())}, "
+                f"body={_snippet}"
             )
             return success and bool(session.unb)
 
@@ -529,7 +537,7 @@ class QRLoginManager:
                     await asyncio.sleep(0.8)  # 每0.8秒检查一次
 
                 except Exception as e:
-                    logger.error(f"监控二维码状态异常: {e}")
+                    logger.error(f"监控二维码状态异常: {type(e).__name__}: {e!r}")
                     await asyncio.sleep(2)
 
             # 超时处理。验证态超时同样要收口，否则前端会一直等一个不会再变的状态。

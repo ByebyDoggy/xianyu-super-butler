@@ -4,8 +4,10 @@ Get-CimInstance Win32_Process -Filter "Name='python.exe'" -ErrorAction SilentlyC
     Where-Object { $_.CommandLine -like '*xianyu-super-butler*' -and $_.CommandLine -notlike '*3.2*' -and $_.CommandLine -like '*Start.py*' } |
     ForEach-Object { Write-Output "killing pid=$($_.ProcessId)"; Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
 $c = Get-NetTCPConnection -LocalPort 8080 -State Listen -ErrorAction SilentlyContinue
-foreach ($pid in @($c.OwningProcess | Sort-Object -Unique)) {
-    if ($pid) { Write-Output "killing port owner pid=$pid"; Stop-Process -Id $pid -Force -ErrorAction SilentlyContinue }
+# Do NOT use $pid here: it is a read-only automatic variable in PowerShell,
+# assigning it throws and skips the kill. Use $procId instead.
+foreach ($procId in @($c.OwningProcess | Sort-Object -Unique)) {
+    if ($procId) { Write-Output "killing port owner pid=$procId"; Stop-Process -Id $procId -Force -ErrorAction SilentlyContinue }
 }
 Start-Sleep -Seconds 3
 if (Get-NetTCPConnection -LocalPort 8080 -State Listen -ErrorAction SilentlyContinue) {
